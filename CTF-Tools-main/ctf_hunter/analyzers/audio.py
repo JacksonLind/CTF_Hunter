@@ -410,6 +410,19 @@ class AudioAnalyzer(Analyzer):
                                 confidence=0.82,
                             ))
 
+                            # OCR: attempt to read text rendered in the
+                            # spectrogram image — this is how the flag is
+                            # extracted from spectral steganography.
+                            if img_path:
+                                findings.extend(
+                                    self._ocr_spectrogram(
+                                        path, img_path, normed,
+                                        flag_pattern, band_label,
+                                        sig_label, win_label,
+                                        win_s, win_e, rate,
+                                    )
+                                )
+
         finally:
             # Step 4 — cleanup all temp files
             for f in tmp_files:
@@ -421,6 +434,111 @@ class AudioAnalyzer(Analyzer):
                 os.rmdir(tmp_dir)
             except OSError:
                 pass
+
+        return findings
+
+    # ------------------------------------------------------------------
+    # Spectrogram OCR
+    # ------------------------------------------------------------------
+
+    def _ocr_spectrogram(
+        self,
+        path: str,
+        img_path: str,
+        normed_array,
+        flag_pattern: re.Pattern,
+        band_label: str,
+        sig_label: str,
+        win_label: str,
+        win_s: int,
+        win_e: int,
+        rate: int,
+    ) -> List[Finding]:
+        """Run OCR on a normalised spectrogram image to extract hidden text.
+
+        Tries multiple image pre-processing passes to maximise readability:
+        - Raw image (as-is)
+        - Vertically flipped (some tools render text upside-down)
+        - Contrast-stretched version (histogram equalisation)
+        - Inverted (white text on black background)
+
+        Uses pytesseract if available. Gracefully skips and emits an INFO
+        finding if pytesseract or its Tesseract binary is not installed.
+        """
+        findings: List[Finding] = []
+        try:
+            import pytesseract
+            from PIL import Image, ImageOps, ImageFilter
+            import numpy as np
+        except ImportError:
+            findings.append(self._finding(
+                path,
+                "Spectrogram OCR skipped — pytesseract not installed",
+                "Run: pip install pytesseract  "
+                "(also requires Tesseract: https://github.com/tesseract-ocr/tesseract)",
+                severity="INFO",
+                confidence=0.0,
+            ))
+            return findings
+
+        # Build a set of image variants to try OCR on
+        try:
+            base_img = Image.fromarray(normed_array)
+        except Exception:
+            return findings
+
+        # Scale up — Tesseract works much better on larger images
+        w, h = base_img.size
+        scale = max(1, 400 // max(h, 1))
+        if scale > 1:
+            base_img = base_img.resize((w * scale, h * scale), Image.NEAREST)
+
+        variants = [
+            ("raw",      base_img),
+            ("flipped",  base_img.transpose(Image.FLIP_TOP_BOTTOM)),
+            ("inverted", ImageOps.invert(base_img)),
+            ("equalized", ImageOps.equalize(base_img)),
+        ]
+
+        seen_texts: set = set()
+        for variant_label, img_variant in variants:
+            try:
+                # PSM 6 = assume a single uniform block of text
+                ocr_text = pytesseract.image_to_string(
+                    img_variant,
+                    config="--psm 6 --oem 3",
+                ).strip()
+            except Exception:
+                continue
+
+            if not ocr_text or ocr_text in seen_texts:
+                continue
+            seen_texts.add(ocr_text)
+
+            # Clean up common OCR noise
+            cleaned = re.sub(r"[^\x20-\x7E]", "", ocr_text).strip()
+            if len(cleaned) < 3:
+                continue
+
+            fm = self._check_flag(cleaned, flag_pattern)
+            findings.append(self._finding(
+                path,
+                f"Spectrogram OCR text extracted ({band_label} Hz, "
+                f"{variant_label})",
+                f"Signal: {sig_label}\n"
+                f"Window: {win_label} "
+                f"({win_s/rate:.1f}s–{win_e/rate:.1f}s)\n"
+                f"Band: {band_label}\n"
+                f"Variant: {variant_label}\n"
+                f"OCR output: {cleaned[:300]}",
+                severity="HIGH" if fm else "MEDIUM",
+                flag_match=fm,
+                confidence=0.90 if fm else 0.65,
+            ))
+
+            # Stop trying variants once we get a flag match
+            if fm:
+                break
 
         return findings
 
