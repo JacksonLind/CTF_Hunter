@@ -224,22 +224,44 @@ class AudioAnalyzer(Analyzer):
                 ))
                 return findings
 
+            # --- ffmpeg availability check ----------------------------------
+            try:
+                import imageio_ffmpeg
+                ffmpeg_exe  = imageio_ffmpeg.get_ffmpeg_exe()
+                ffprobe_exe = str(Path(ffmpeg_exe).parent / "ffprobe")
+                # On Windows the binary has no extension check — try with .exe too
+                if not Path(ffprobe_exe).exists():
+                    ffprobe_exe = str(Path(ffmpeg_exe).parent / "ffprobe.exe")
+                if not Path(ffprobe_exe).exists():
+                    # imageio-ffmpeg only bundles ffmpeg, not ffprobe — fall back
+                    # to using ffmpeg itself for stream detection via stderr parse
+                    ffprobe_exe = None
+            except ImportError:
+                findings.append(self._finding(
+                    path,
+                    "Phase cancellation skipped — imageio-ffmpeg not installed",
+                    "Run: pip install imageio-ffmpeg",
+                    severity="INFO",
+                    confidence=0.0,
+                ))
+                return findings
+
             # --- Step 1: count audio streams --------------------------------
-            stream_count = self._ffprobe_stream_count(path)
+            stream_count = self._ffprobe_stream_count(path, ffprobe_exe, ffmpeg_exe)
 
             # --- Step 2: extract streams to WAV -----------------------------
             wav_paths: List[str] = []
             if stream_count >= 2:
                 for idx in range(stream_count):
                     out = os.path.join(tmp_dir, f"stream_{idx}.wav")
-                    ok = self._ffmpeg_extract_stream(path, idx, out)
+                    ok = self._ffmpeg_extract_stream(path, idx, out, ffmpeg_exe)
                     if ok:
                         wav_paths.append(out)
                         tmp_files.append(out)
             else:
                 # Single stream — extract directly for spectrogram scan
                 out = os.path.join(tmp_dir, "stream_0.wav")
-                ok = self._ffmpeg_extract_stream(path, 0, out)
+                ok = self._ffmpeg_extract_stream(path, 0, out, ffmpeg_exe)
                 if ok:
                     wav_paths.append(out)
                     tmp_files.append(out)
@@ -407,36 +429,65 @@ class AudioAnalyzer(Analyzer):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _ffprobe_stream_count(path: str) -> int:
-        """Return the number of audio streams in *path* via ffprobe JSON output.
-        Falls back to 1 if ffprobe is unavailable or fails.
+    def _ffprobe_stream_count(
+        path: str,
+        ffprobe_exe: Optional[str],
+        ffmpeg_exe: str,
+    ) -> int:
+        """Return the number of audio streams in *path*.
+
+        Uses ffprobe when available (bundled alongside imageio-ffmpeg's ffmpeg
+        on most platforms).  Falls back to parsing ffmpeg's stderr stream list
+        when ffprobe is absent — imageio-ffmpeg only guarantees ffmpeg itself.
         """
+        # Try ffprobe first (most reliable)
+        if ffprobe_exe and Path(ffprobe_exe).exists():
+            try:
+                result = subprocess.run(
+                    [
+                        ffprobe_exe, "-v", "quiet",
+                        "-print_format", "json",
+                        "-show_streams",
+                        "-select_streams", "a",
+                        path,
+                    ],
+                    capture_output=True,
+                    timeout=30,
+                )
+                data = json.loads(result.stdout)
+                return len(data.get("streams", []))
+            except Exception:
+                pass
+
+        # Fallback: parse ffmpeg stderr which lists streams on startup
         try:
             result = subprocess.run(
-                [
-                    "ffprobe", "-v", "quiet",
-                    "-print_format", "json",
-                    "-show_streams",
-                    "-select_streams", "a",
-                    path,
-                ],
+                [ffmpeg_exe, "-i", path],
                 capture_output=True,
                 timeout=30,
             )
-            data = json.loads(result.stdout)
-            return len(data.get("streams", []))
+            # ffmpeg prints stream info to stderr even when it errors out
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            # Count lines matching "Stream #0:N: Audio:"
+            audio_streams = len(re.findall(r"Stream #\d+:\d+.*?Audio:", stderr))
+            return audio_streams if audio_streams > 0 else 1
         except Exception:
             return 1
 
     @staticmethod
-    def _ffmpeg_extract_stream(path: str, stream_index: int, out_path: str) -> bool:
+    def _ffmpeg_extract_stream(
+        path: str,
+        stream_index: int,
+        out_path: str,
+        ffmpeg_exe: str,
+    ) -> bool:
         """Extract audio stream *stream_index* from *path* to a 2-channel WAV.
-        Returns True on success.
+        Uses the ffmpeg binary resolved by imageio-ffmpeg. Returns True on success.
         """
         try:
             result = subprocess.run(
                 [
-                    "ffmpeg", "-y",
+                    ffmpeg_exe, "-y",
                     "-i", path,
                     "-map", f"0:a:{stream_index}",
                     "-ac", "2",
