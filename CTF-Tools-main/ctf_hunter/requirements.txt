@@ -1,0 +1,18 @@
+PyQt6>=6.6.0
+Pillow>=10.0.0
+mutagen>=1.47.0
+python-magic>=0.4.27
+numpy>=1.26.0
+scapy>=2.5.0
+capstone>=5.0.0
+r2pipe>=1.9.0          # Python bindings only — radare2 binary must be installed separately at the system level (e.g. apt install radare2 / brew install radare2)
+anthropic>=0.25.0
+watchdog>=4.0.0
+pyzipper>=0.3.6
+olefile>=0.47
+PyMuPDF>=1.23.0
+pyinstaller>=6.0.0
+bcrypt>=4.0.0
+# Optional: dynamic Frida instrumentation (Task 4). Remove the leading '#' to install.
+# frida>=16.0.0
+# frida-tools>=12.0.0

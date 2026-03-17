@@ -1,0 +1,19 @@
+{
+  "application": "CTF Challenge",
+  "version": "1.0",
+  "config": {
+    "debug": false,
+    "secret_key": "flag{json_nested_secret}",
+    "database": "production.db"
+  },
+  "users": [
+    {
+      "id": 1,
+      "role": "admin"
+    },
+    {
+      "id": 2,
+      "role": "user"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+This file contains whitespace-encoded data.
+Hint: flag{whitespace_tab_spaces}
+ 		  		 
+ 		 		  
+ 		    	
+ 		  			
+ 				 		
+ 			 			
+ 		 	   
+ 		 	  	
+ 			 	  
+ 		  	 	
+ 			  		
+ 			    
+ 		    	
+ 		   		
+ 		  	 	
+ 	 					
+ 			 	  
+ 		    	
+ 		   	 
+ 	 					
+ 			  		
+ 			    
+ 		    	
+ 		   		
+ 		  	 	
+ 			  		
+ 					 	
