@@ -4,7 +4,9 @@ Archive analyzer: ZIP comment, encrypted entries, path traversal, wordlist crack
 from __future__ import annotations
 
 import io
+import os
 import re
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import List, Optional
@@ -201,16 +203,22 @@ class ArchiveAnalyzer(Analyzer):
         dispatcher_module=None,
         _nest_depth: int = 0,
     ) -> List[Finding]:
-        import tempfile
         findings: List[Finding] = []
         for info in zf.infolist():
             if info.filename.lower().endswith((".zip", ".gz", ".tar")):
+                tmp_path = None
                 try:
                     data = zf.read(info.filename)
-                    # Use a secure temp file (cross-platform, no path traversal)
-                    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_fh:
-                        tmp_fh.write(data)
-                        tmp_path = tmp_fh.name
+                    # Use mkstemp so we can close the fd immediately before
+                    # passing the path to the nested analyzer.  On Windows,
+                    # NamedTemporaryFile holds an exclusive lock while the
+                    # context-manager is open, which prevents the analyzer
+                    # from opening the same file and raises PermissionError.
+                    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+                    try:
+                        os.write(tmp_fd, data)
+                    finally:
+                        os.close(tmp_fd)  # release handle before analyzer opens it
                     nested_analyzer = ArchiveAnalyzer()
                     nested = nested_analyzer.analyze(
                         tmp_path, flag_pattern, depth, ai_client,
@@ -220,9 +228,15 @@ class ArchiveAnalyzer(Analyzer):
                     for f in nested:
                         f.title = f"[nested:{info.filename}] " + f.title
                     findings.extend(nested)
-                    Path(tmp_path).unlink(missing_ok=True)
                 except Exception:
+                    # Silently skip individual nested entries that cannot be
+                    # extracted or analyzed (e.g. encrypted, corrupted, or
+                    # unsupported format) so one bad entry doesn't abort the
+                    # rest of the archive.
                     pass
+                finally:
+                    if tmp_path:
+                        Path(tmp_path).unlink(missing_ok=True)
         return findings
 
     def _check_generic_archive(self, path: str, flag_pattern: re.Pattern) -> List[Finding]:
