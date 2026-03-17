@@ -185,6 +185,16 @@ class ConfidenceScorer:
                 f.confidence = min(_MAX_CONFIDENCE, f.confidence + _FLAG_DECODE_BOOST)
                 f.flag_match = True
 
+            # Flag-prefix printability check: if decoded output contains "flag{" or
+            # "FLAG{" but the tail is mostly non-printable, the match is likely garbage
+            # (e.g. from a false-positive XOR decode) — apply a confidence penalty.
+            flag_prefix_m = re.search(r'(?:flag|FLAG)\{', decoded)
+            if flag_prefix_m:
+                tail = decoded[flag_prefix_m.start():]
+                printable = sum(1 for c in tail if 0x20 <= ord(c) <= 0x7E)
+                if len(tail) > 0 and (printable / len(tail)) < 0.80:
+                    f.confidence = max(0.0, f.confidence - 0.35)
+
             decoded_ent = _string_entropy(decoded)
 
             # Extract the input (before '→') to compare entropy

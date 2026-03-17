@@ -285,6 +285,12 @@ class ContentClassifier:
 
         # Binary string (0 / 1 / whitespace, groups of 8 bits) ---------------
         # Must come before hex: '0' and '1' are valid hex digits.
+
+        # Space-separated 8-bit binary (checked before compact binary so the two
+        # encodings are routed independently).
+        if re.fullmatch(r'[01]{8}( [01]{8})+', stripped):
+            return "space_binary", ["encoding", "classical_cipher"], 0.87
+
         bin_ratio = sum(1 for c in stripped if ord(c) in _BINARY_CHARS) / n
         if (
             bin_ratio > 0.95

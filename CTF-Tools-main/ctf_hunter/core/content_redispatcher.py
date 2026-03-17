@@ -294,6 +294,11 @@ class ContentRedispatcher:
             if dec:
                 results.append(self._child(content, dec, "binary"))
 
+        elif enc == "space_binary":
+            dec = _try_space_binary(data)
+            if dec:
+                results.append(self._child(content, dec, "space_binary"))
+
         elif enc == "morse":
             dec = _try_morse(data)
             if dec:
@@ -600,12 +605,30 @@ def _try_hex(data: bytes) -> Optional[bytes]:
 
 
 def _try_binary(data: bytes) -> Optional[bytes]:
-    """Convert a space/newline-separated binary string to bytes."""
+    """Convert a compact (no-space) binary string to bytes."""
     text = data.decode("ascii", errors="ignore").strip()
     bits = text.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
     if not bits or len(bits) % 8 != 0 or not set(bits) <= {"0", "1"}:
         return None
     return bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
+
+
+# Matches space-separated 8-bit binary groups, e.g. "01100110 01101100 01100001 01100111".
+# Distinct from the compact-binary pattern (no embedded spaces).
+_SPACE_BINARY_RE = re.compile(rb'^([01]{8})( [01]{8})+$')
+
+
+def _try_space_binary(data: bytes) -> Optional[bytes]:
+    """Convert a space-separated 8-bit binary string to its ASCII byte representation.
+
+    Each space-delimited token must be exactly 8 binary digits (0 or 1).
+    Returns the decoded bytes, or *None* if the input does not match the pattern.
+    """
+    text = data.decode("ascii", errors="ignore").strip()
+    groups = text.split(" ")
+    if not groups or not all(len(g) == 8 and set(g) <= {"0", "1"} for g in groups):
+        return None
+    return bytes(int(g, 2) for g in groups)
 
 
 def _try_morse(data: bytes) -> Optional[bytes]:
