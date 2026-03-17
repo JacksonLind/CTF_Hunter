@@ -12,7 +12,7 @@ import re
 import string
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.report import Finding
 from core.ai_client import AIClient
@@ -396,6 +396,47 @@ def _cosine_similarity(v1: Dict[str, float], v2: Dict[str, float]) -> float:
     return dot / (mag1 * mag2)
 
 
+def _atbash(s: str) -> str:
+    """Apply Atbash substitution cipher (A↔Z, a↔z)."""
+    result = []
+    for c in s:
+        if 'a' <= c <= 'z':
+            result.append(chr(ord('z') - (ord(c) - ord('a'))))
+        elif 'A' <= c <= 'Z':
+            result.append(chr(ord('Z') - (ord(c) - ord('A'))))
+        else:
+            result.append(c)
+    return ''.join(result)
+
+
+def _build_transform_map() -> Dict[str, Any]:
+    """
+    Auto-discover all _decode_<name> functions in this module and register
+    them by their short name.  Also registers structural transforms (reverse,
+    atbash) that have no _decode_ counterpart.
+
+    Adding a new cipher only requires adding a _decode_<name> function —
+    no manual registration step needed.
+    """
+    import inspect
+    import sys
+    module = sys.modules[__name__]
+    transform_map: Dict[str, Any] = {}
+    for fn_name, fn in inspect.getmembers(module, inspect.isfunction):
+        if fn_name.startswith('_decode_'):
+            transform_name = fn_name[len('_decode_'):]
+            transform_map[transform_name] = fn
+    # Structural transforms: no _decode_ function, registered explicitly.
+    # This list should stay very short — only transforms that aren't decoders.
+    transform_map['reverse'] = lambda s: s[::-1]
+    transform_map['atbash'] = _atbash
+    return transform_map
+
+
+# Built once at import time; automatically includes every _decode_<n> function.
+_TRANSFORM_MAP: Dict[str, Any] = _build_transform_map()
+
+
 def _fuzzy_encoding_candidates(s: str) -> List[Tuple[str, float]]:
     """
     For an unrecognized encoded-looking string, compute character frequency
@@ -639,9 +680,19 @@ class EncodingAnalyzer(Analyzer):
         return findings
 
     def _header_context_decode(self, path: str, flag_pattern: re.Pattern) -> List[Finding]:
-        """Scan the file as text for 'Encoding: ... base85' header lines and
-        force-attempt base64.b85decode() on the payload block that follows,
-        regardless of what the character-frequency heuristic would score.
+        """Scan the file for inline encoding pipeline declarations and execute them.
+
+        Detects lines of the form::
+
+            Encoding: <step1>/<step2>/... pipeline
+
+        Parses the declared transform names, looks each up in ``_TRANSFORM_MAP``
+        (auto-built from every ``_decode_<n>`` function in this module plus
+        structural transforms like ``reverse`` and ``atbash``), then applies
+        them in sequence to the payload block that follows.
+
+        Adding a new cipher requires only a ``_decode_<n>`` function — no
+        changes here are needed.
         """
         findings: List[Finding] = []
         try:
@@ -652,9 +703,13 @@ class EncodingAnalyzer(Analyzer):
         lines = text.splitlines()
         i = 0
         while i < len(lines):
-            if re.search(r"(?i)encoding[:\s]+.*base85", lines[i]):
-                # Found a base85 header context; collect the payload block below.
-                # Scan forward for an explicit "payload:" label within a small window.
+            header_m = re.search(r"(?i)encoding[:\s]+([\w/]+)", lines[i])
+            if header_m:
+                # Parse the transform pipeline from the header line itself
+                raw_transforms = header_m.group(1)
+                transforms = [t.strip().lower() for t in raw_transforms.split('/') if t.strip()]
+
+                # Collect the payload block
                 payload_lines: List[str] = []
                 window_end = min(i + 20, len(lines))
                 payload_label_idx: Optional[int] = None
@@ -664,7 +719,6 @@ class EncodingAnalyzer(Analyzer):
                         break
 
                 if payload_label_idx is not None:
-                    # Collect content lines after the "payload:" label
                     j = payload_label_idx + 1
                     while j < len(lines):
                         stripped = lines[j].strip()
@@ -673,7 +727,6 @@ class EncodingAnalyzer(Analyzer):
                         payload_lines.append(stripped)
                         j += 1
                 else:
-                    # No explicit label: grab the first non-empty, non-header line
                     for j in range(i + 1, window_end):
                         stripped = lines[j].strip()
                         if stripped and not re.match(r"^\[", stripped):
@@ -681,31 +734,30 @@ class EncodingAnalyzer(Analyzer):
                             break
 
                 payload = "".join(payload_lines)
-                if payload:
-                    decoded = _decode_base85(payload)
-                    if decoded and _is_printable(decoded):
-                        fm = self._check_flag(decoded, flag_pattern)
+
+                # Only proceed if we have a payload and at least one known transform
+                known = [t for t in transforms if t in _TRANSFORM_MAP]
+                if payload and known:
+                    current: Optional[str] = payload
+                    applied: List[str] = []
+                    for step in transforms:
+                        fn = _TRANSFORM_MAP.get(step)
+                        if fn is None or current is None:
+                            break
+                        current = fn(current)
+                        applied.append(step)
+
+                    if current and current != payload and _is_printable(current):
+                        fm = self._check_flag(current, flag_pattern)
+                        chain_label = "→".join(applied)
                         findings.append(self._finding(
                             path,
-                            "Base85 force-decoded (header context)",
-                            f"Encoding header triggered Base85 decode → {decoded[:200]}",
+                            f"Multi-layer decoded ({chain_label})",
+                            f"Pipeline decoded → {current[:200]}",
                             severity="HIGH" if fm else "MEDIUM",
                             flag_match=fm,
-                            confidence=0.85 if fm else 0.60,
+                            confidence=0.99 if fm else 0.80,
                         ))
-                        # Further decode if the Base85 payload is space-separated 8-bit binary
-                        if SPACE_BINARY_RE.match(decoded.strip()):
-                            further = _decode_space_binary(decoded.strip())
-                            if further:
-                                fm2 = self._check_flag(further, flag_pattern)
-                                findings.append(self._finding(
-                                    path,
-                                    "Space-binary decoded (from Base85 payload)",
-                                    f"Binary groups decoded → {further[:200]}",
-                                    severity="HIGH" if fm2 else "MEDIUM",
-                                    flag_match=fm2,
-                                    confidence=0.87 if fm2 else 0.62,
-                                ))
             i += 1
 
         return findings
