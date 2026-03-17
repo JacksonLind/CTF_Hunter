@@ -563,7 +563,7 @@ class PcapAnalyzer(Analyzer):
             if total > 0:
                 for iface_id, count in iface_packets.items():
                     ratio = count / total
-                    if 50 <= count <= 5000 and ratio < 0.01:
+                    if 50 <= count <= 5000 and ratio < 0.10:
                         findings.append(self._finding(
                             path,
                             f"Low-volume interface #{iface_id} — likely covert candidate",
@@ -640,14 +640,17 @@ class PcapAnalyzer(Analyzer):
                 ts_high  = struct.unpack_from(f"{endian}I", mm, pos + 12)[0]
                 ts_low   = struct.unpack_from(f"{endian}I", mm, pos + 16)[0]
                 ts_raw   = (ts_high << 32) | ts_low
-                resol    = iface_tsresol.get(iface_id, 1e-6)
+                resol    = iface_tsresol.get(iface_id)
+                if resol is None:
+                    pos += bl
+                    continue
                 iface_times[iface_id].append(ts_raw * resol)
 
             pos += bl
 
         for iface_id, times in iface_times.items():
             n = len(times)
-            if not (50 <= n <= 5000):
+            if n < 10:
                 continue
 
             times_sorted = sorted(times)
