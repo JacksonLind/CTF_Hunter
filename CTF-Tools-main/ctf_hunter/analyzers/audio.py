@@ -3,10 +3,14 @@ Audio analyzer: LSB in WAV samples, ID3 metadata, silence blocks.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import struct
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from core.report import Finding
 from core.ai_client import AIClient
@@ -35,6 +39,9 @@ class AudioAnalyzer(Analyzer):
         if depth == "deep":
             # LSB in WAV PCM
             findings.extend(self._check_wav_lsb(path, flag_pattern))
+
+        # Phase cancellation + spectrogram steg (always run — too valuable to gate on deep)
+        findings.extend(self._phase_cancellation_analysis(path, flag_pattern))
 
         self._run_redispatch_hook(findings, session, dispatcher_module)
         return findings
@@ -177,3 +184,268 @@ class AudioAnalyzer(Analyzer):
                 confidence=0.75 if fm else 0.55,
             )]
         return []
+
+    # ------------------------------------------------------------------
+    # Phase cancellation + spectrogram steganography
+    # ------------------------------------------------------------------
+
+    def _phase_cancellation_analysis(
+        self, path: str, flag_pattern: re.Pattern
+    ) -> List[Finding]:
+        """Detect spectral steganography via phase cancellation and spectrogram analysis.
+
+        Steps:
+        1. Use ffprobe to count audio streams.
+        2. Extract each stream to a temp WAV with ffmpeg.
+        3. Subtract stream pairs (phase cancellation) to isolate hidden signal.
+        4. Run spectrogram on diff (or single stream) across multiple frequency
+           bands and time windows — high-variance bands indicate rendered text.
+        5. Save spectrogram images as findings so the UI can display them.
+        6. Clean up all temp files in a finally block.
+        """
+        findings: List[Finding] = []
+        tmp_dir = tempfile.mkdtemp(prefix="ctfhunter_audio_")
+        tmp_files: List[str] = []
+
+        try:
+            # --- dependency check -------------------------------------------
+            try:
+                import numpy as np
+                from scipy import signal as scipy_signal
+                from scipy.io import wavfile
+                from PIL import Image
+            except ImportError as e:
+                findings.append(self._finding(
+                    path,
+                    "Phase cancellation skipped — missing dependency",
+                    f"Install required packages: scipy numpy Pillow\nError: {e}",
+                    severity="INFO",
+                    confidence=0.0,
+                ))
+                return findings
+
+            # --- Step 1: count audio streams --------------------------------
+            stream_count = self._ffprobe_stream_count(path)
+
+            # --- Step 2: extract streams to WAV -----------------------------
+            wav_paths: List[str] = []
+            if stream_count >= 2:
+                for idx in range(stream_count):
+                    out = os.path.join(tmp_dir, f"stream_{idx}.wav")
+                    ok = self._ffmpeg_extract_stream(path, idx, out)
+                    if ok:
+                        wav_paths.append(out)
+                        tmp_files.append(out)
+            else:
+                # Single stream — extract directly for spectrogram scan
+                out = os.path.join(tmp_dir, "stream_0.wav")
+                ok = self._ffmpeg_extract_stream(path, 0, out)
+                if ok:
+                    wav_paths.append(out)
+                    tmp_files.append(out)
+
+            if not wav_paths:
+                return findings
+
+            # --- Step 3: phase cancellation on all pairs --------------------
+            diff_signals: List[Tuple[str, object, int]] = []  # (label, array, rate)
+
+            if len(wav_paths) >= 2:
+                for i in range(len(wav_paths)):
+                    for j in range(i + 1, len(wav_paths)):
+                        try:
+                            rate1, s1 = wavfile.read(wav_paths[i])
+                            rate2, s2 = wavfile.read(wav_paths[j])
+                        except Exception:
+                            continue
+
+                        # Ensure same length
+                        min_len = min(len(s1), len(s2))
+                        s1 = s1[:min_len]
+                        s2 = s2[:min_len]
+
+                        diff = s1.astype(np.int32) - s2.astype(np.int32)
+                        max_delta = int(np.max(np.abs(diff)))
+
+                        if max_delta < 10:
+                            # Streams are identical — no hidden signal
+                            continue
+
+                        label = f"stream{i}_minus_stream{j}"
+                        findings.append(self._finding(
+                            path,
+                            f"Phase cancellation: streams {i} and {j} differ "
+                            f"(max delta {max_delta})",
+                            f"Pair: stream {i} − stream {j}\n"
+                            f"Max sample delta: {max_delta}\n"
+                            f"Range hint: {'subtle hidden signal' if max_delta <= 10000 else 'large difference'}",
+                            severity="MEDIUM",
+                            confidence=0.70,
+                        ))
+                        diff_signals.append((label, diff, rate1))
+
+            # Also add raw streams for single-stream spectrogram scan
+            if not diff_signals:
+                for idx, wp in enumerate(wav_paths):
+                    try:
+                        rate, data = wavfile.read(wp)
+                        diff_signals.append((f"stream{idx}_raw", data, rate))
+                    except Exception:
+                        continue
+
+            # --- Step 4: spectrogram scan -----------------------------------
+            BANDS = [
+                ("11k-16.5k",  11000, 16500),
+                ("16.5k-20k",  16500, 20000),
+                ("8k-11k",      8000, 11000),
+            ]
+
+            for sig_label, sig_data, rate in diff_signals:
+                # Use first channel only
+                if sig_data.ndim > 1:
+                    channel = sig_data[:, 0].astype(np.float32)
+                else:
+                    channel = sig_data.astype(np.float32)
+
+                total_samples = len(channel)
+                duration_sec = total_samples / rate if rate > 0 else 0
+
+                # Time windows: full track + fixed 30-second slices
+                windows: List[Tuple[str, int, int]] = [("full", 0, total_samples)]
+                for win_start_sec in (0, 20, 50):
+                    win_end_sec = win_start_sec + 30
+                    s = int(win_start_sec * rate)
+                    e = int(win_end_sec * rate)
+                    if s < total_samples and e - s > rate:  # at least 1s of data
+                        e = min(e, total_samples)
+                        windows.append((
+                            f"{win_start_sec}s-{win_end_sec}s", s, e
+                        ))
+
+                for win_label, win_s, win_e in windows:
+                    segment = channel[win_s:win_e]
+                    if len(segment) < 512:
+                        continue
+
+                    try:
+                        f_arr, _t, Sxx = scipy_signal.spectrogram(
+                            segment, rate,
+                            nperseg=512,
+                            noverlap=480,
+                        )
+                    except Exception:
+                        continue
+
+                    power_db = 10.0 * np.log10(np.abs(Sxx) + 1e-12)
+
+                    for band_label, f_lo_hz, f_hi_hz in BANDS:
+                        if f_hi_hz > rate / 2:
+                            continue  # band above Nyquist for this file
+
+                        idx_lo = int(np.searchsorted(f_arr, f_lo_hz))
+                        idx_hi = int(np.searchsorted(f_arr, f_hi_hz))
+                        if idx_hi <= idx_lo:
+                            continue
+
+                        band = power_db[idx_lo:idx_hi, :]
+                        if band.size == 0:
+                            continue
+
+                        # Normalise to 0-255 and flip frequency axis
+                        b_min, b_max = band.min(), band.max()
+                        if b_max == b_min:
+                            continue
+                        normed = ((band - b_min) / (b_max - b_min) * 255).astype(np.uint8)
+                        normed = normed[::-1]  # low freq at bottom
+
+                        variance = float(np.std(normed))
+                        is_suspicious = variance > 15.0
+
+                        img_path = os.path.join(
+                            tmp_dir,
+                            f"spect_{sig_label}_{win_label}_{band_label}.png",
+                        )
+                        tmp_files.append(img_path)
+                        try:
+                            Image.fromarray(normed).save(img_path)
+                        except Exception:
+                            img_path = ""
+
+                        if is_suspicious:
+                            findings.append(self._finding(
+                                path,
+                                f"Spectrogram steg candidate: {band_label} Hz "
+                                f"[{sig_label}] [{win_label}] "
+                                f"(variance={variance:.1f})",
+                                f"Signal: {sig_label}\n"
+                                f"Window: {win_label} "
+                                f"({win_s/rate:.1f}s–{win_e/rate:.1f}s)\n"
+                                f"Band: {f_lo_hz}–{f_hi_hz} Hz\n"
+                                f"Pixel std-dev: {variance:.1f} "
+                                f"(>15 indicates non-noise content)\n"
+                                f"Spectrogram image: {img_path}",
+                                severity="HIGH",
+                                confidence=0.82,
+                            ))
+
+        finally:
+            # Step 4 — cleanup all temp files
+            for f in tmp_files:
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+
+        return findings
+
+    # ------------------------------------------------------------------
+    # ffprobe / ffmpeg helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ffprobe_stream_count(path: str) -> int:
+        """Return the number of audio streams in *path* via ffprobe JSON output.
+        Falls back to 1 if ffprobe is unavailable or fails.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_streams",
+                    "-select_streams", "a",
+                    path,
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            data = json.loads(result.stdout)
+            return len(data.get("streams", []))
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _ffmpeg_extract_stream(path: str, stream_index: int, out_path: str) -> bool:
+        """Extract audio stream *stream_index* from *path* to a 2-channel WAV.
+        Returns True on success.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", path,
+                    "-map", f"0:a:{stream_index}",
+                    "-ac", "2",
+                    "-ar", "44100",
+                    out_path,
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            return result.returncode == 0 and Path(out_path).exists()
+        except Exception:
+            return False
