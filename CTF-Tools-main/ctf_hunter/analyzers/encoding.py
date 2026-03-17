@@ -30,6 +30,11 @@ _MORSE_MAP = {
     "--...": "7", "---..": "8", "----.": "9",
 }
 
+# Matches a string of 8-bit binary groups separated by single whitespace characters,
+# e.g. "01100110 01101100 01100001 01100111".  Used to detect space-separated binary
+# output from multi-layer decoding pipelines (e.g. after a Base85 decode stage).
+SPACE_BINARY_RE = re.compile(r'^([01]{8})(\s[01]{8})+$')
+
 
 def _is_printable(text: str, threshold: float = 0.85) -> bool:
     if not text:
@@ -110,6 +115,21 @@ def _decode_binary(s: str) -> Optional[str]:
         for i in range(0, len(clean), 8):
             result += chr(int(clean[i:i+8], 2))
         return result
+    except Exception:
+        return None
+
+
+def _decode_space_binary(s: str) -> Optional[str]:
+    """Decode a space-separated 8-bit binary string to ASCII text.
+
+    Each whitespace-delimited token must be exactly 8 binary digits (0/1).
+    Returns the joined character string, or *None* if any token is invalid.
+    """
+    groups = s.strip().split()
+    if not groups:
+        return None
+    try:
+        return "".join(chr(int(b, 2)) for b in groups)
     except Exception:
         return None
 
@@ -472,6 +492,21 @@ class EncodingAnalyzer(Analyzer):
                     continue
 
             # Binary
+            # Space-separated 8-bit binary (must be checked before compact binary)
+            if SPACE_BINARY_RE.match(s_stripped):
+                decoded = _decode_space_binary(s_stripped)
+                if decoded and _is_printable(decoded):
+                    fm = self._check_flag(decoded, flag_pattern)
+                    findings.append(self._finding(
+                        path,
+                        "Space-binary decoded string",
+                        f"Input: {s_stripped[:60]!r} → {decoded[:200]}",
+                        severity="HIGH" if fm else "MEDIUM",
+                        flag_match=fm,
+                        confidence=0.75 if fm else 0.50,
+                    ))
+                    continue
+
             if re.match(r"^[01\s]{16,}$", s_stripped):
                 decoded = _decode_binary(s_stripped)
                 if decoded and _is_printable(decoded):
@@ -658,6 +693,19 @@ class EncodingAnalyzer(Analyzer):
                             flag_match=fm,
                             confidence=0.85 if fm else 0.60,
                         ))
+                        # Further decode if the Base85 payload is space-separated 8-bit binary
+                        if SPACE_BINARY_RE.match(decoded.strip()):
+                            further = _decode_space_binary(decoded.strip())
+                            if further:
+                                fm2 = self._check_flag(further, flag_pattern)
+                                findings.append(self._finding(
+                                    path,
+                                    "Space-binary decoded (from Base85 payload)",
+                                    f"Binary groups decoded → {further[:200]}",
+                                    severity="HIGH" if fm2 else "MEDIUM",
+                                    flag_match=fm2,
+                                    confidence=0.87 if fm2 else 0.62,
+                                ))
             i += 1
 
         return findings

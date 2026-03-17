@@ -37,6 +37,14 @@ _MAX_CONFIDENCE = 0.99
 _HIGH_ENTROPY_THRESHOLD = 7.0    # > this → likely encrypted/compressed garbage
 _MEDIUM_ENTROPY_THRESHOLD = 6.5  # > this → suspicious if mostly non-printable
 
+# Minimum fraction of printable (0x20–0x7E) characters required in the tail
+# following a flag{ / FLAG{ prefix before a confidence penalty is applied.
+_MIN_FLAG_PRINTABLE_RATIO = 0.80
+
+# Penalty applied when a flag-prefix match is followed by mostly non-printable
+# output (e.g. a false-positive XOR decode that happens to start with "flag{").
+_GARBAGE_FLAG_PENALTY = 0.35
+
 
 def _shannon_entropy(data: bytes) -> float:
     if not data:
@@ -184,6 +192,16 @@ class ConfidenceScorer:
             if flag_re.search(decoded) and not f.flag_match:
                 f.confidence = min(_MAX_CONFIDENCE, f.confidence + _FLAG_DECODE_BOOST)
                 f.flag_match = True
+
+            # Flag-prefix printability check: if decoded output contains "flag{" or
+            # "FLAG{" but the tail is mostly non-printable, the match is likely garbage
+            # (e.g. from a false-positive XOR decode) — apply a confidence penalty.
+            flag_prefix_m = re.search(r'(?:flag|FLAG)\{', decoded)
+            if flag_prefix_m:
+                tail = decoded[flag_prefix_m.start():]
+                printable = sum(1 for c in tail if 0x20 <= ord(c) <= 0x7E)
+                if len(tail) > 0 and (printable / len(tail)) < _MIN_FLAG_PRINTABLE_RATIO:
+                    f.confidence = max(0.0, f.confidence - _GARBAGE_FLAG_PENALTY)
 
             decoded_ent = _string_entropy(decoded)
 
