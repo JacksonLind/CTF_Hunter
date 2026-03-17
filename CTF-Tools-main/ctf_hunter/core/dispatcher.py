@@ -33,6 +33,7 @@ from analyzers.classical_cipher import ClassicalCipherAnalyzer
 from analyzers.forensics_timeline import ForensicsTimelineAnalyzer
 from analyzers.image_format import ImageFormatAnalyzer
 from analyzers.crypto_rsa import CryptoRSAAnalyzer
+from analyzers.sal import SalAnalyzer
 
 # ---------------------------------------------------------------------------
 # Magic byte signatures mapped to analyzer keys
@@ -109,6 +110,7 @@ _ANALYZER_REGISTRY: dict[str, type[Analyzer]] = {
     "forensics_timeline": ForensicsTimelineAnalyzer,
     "image_format":    ImageFormatAnalyzer,
     "crypto_rsa":      CryptoRSAAnalyzer,
+    "sal":             SalAnalyzer,
 }
 
 # PEM/DER/RSA detection patterns
@@ -403,6 +405,29 @@ def _identify_analyzers(path: str, data: bytes) -> list[str]:
             for k in analyzer_keys:
                 if k not in keys:
                     keys.append(k)
+
+    # .sal extension — Saleae Logic 2 capture
+    if Path(path).suffix.lower() == ".sal":
+        if "sal" not in keys:
+            keys.append("sal")
+
+    # ZIP archive containing meta.json + digital-N.bin → Saleae .sal
+    if not keys or "archive" in keys:
+        if data[:4] == b"PK\x03\x04" or data[:4] == b"PK\x05\x06":
+            try:
+                import zipfile as _zf
+                with _zf.ZipFile(path, "r") as _z:
+                    _names = _z.namelist()
+                if "meta.json" in _names and any(
+                    re.match(r"digital-\d+\.bin$", n) for n in _names
+                ):
+                    if "sal" not in keys:
+                        keys.append("sal")
+                    # Remove generic archive — sal analyzer handles the ZIP itself
+                    if "archive" in keys:
+                        keys.remove("archive")
+            except Exception:
+                pass
 
     # PCAP extension fallback
     if Path(path).suffix.lower() in (".pcap", ".pcapng", ".cap") and "pcap" not in keys:
