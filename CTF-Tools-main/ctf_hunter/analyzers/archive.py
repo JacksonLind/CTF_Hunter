@@ -43,7 +43,10 @@ class ArchiveAnalyzer(Analyzer):
                 findings.extend(self._check_path_traversal(path, zf))
                 # Nested archives
                 if depth == "deep":
-                    findings.extend(self._check_nested(path, zf, flag_pattern, ai_client))
+                    findings.extend(self._check_nested(
+                        path, zf, flag_pattern, ai_client,
+                        depth=depth, session=session, dispatcher_module=dispatcher_module,
+                    ))
         except (zipfile.BadZipFile, Exception) as exc:
             findings.append(self._finding(
                 path,
@@ -119,10 +122,36 @@ class ArchiveAnalyzer(Analyzer):
                 data = zf.read(target.filename, pwd=password.encode())
                 text = data.decode("utf-8", errors="replace")
                 fm = self._check_flag(text, flag_pattern)
+
+                detail = f"Decrypted '{target.filename}' content: {text[:200]}"
+
+                # When the flag is not immediately visible in the decrypted content
+                # (e.g. it may be XOR-encoded), embed the raw bytes so that the
+                # ContentRedispatcher can apply XOR brute-force and other
+                # transformations via the raw_hex= extraction pipeline.
+                if not fm:
+                    detail += f"\nraw_hex={data.hex()}"
+
+                # Extract all remaining encrypted entries with the found password.
+                # Failures are silently skipped – a single bad entry should not
+                # prevent reporting the successfully cracked password.
+                for entry in encrypted[1:]:
+                    try:
+                        entry_data = zf.read(entry.filename, pwd=password.encode())
+                        entry_text = entry_data.decode("utf-8", errors="replace")
+                        entry_fm = self._check_flag(entry_text, flag_pattern)
+                        if entry_fm:
+                            fm = True
+                            detail += f"\nExtracted '{entry.filename}': {entry_text[:200]}"
+                        else:
+                            detail += f"\nraw_hex={entry_data.hex()}"
+                    except Exception:
+                        pass
+
                 return [self._finding(
                     path,
                     f"ZIP password cracked: '{password}'",
-                    f"Decrypted '{target.filename}' content: {text[:200]}",
+                    detail,
                     severity="HIGH",
                     flag_match=fm,
                     confidence=0.95,
@@ -162,6 +191,9 @@ class ArchiveAnalyzer(Analyzer):
         zf: zipfile.ZipFile,
         flag_pattern: re.Pattern,
         ai_client: Optional[AIClient],
+        depth: str = "deep",
+        session=None,
+        dispatcher_module=None,
     ) -> List[Finding]:
         import tempfile
         findings: List[Finding] = []
@@ -174,7 +206,10 @@ class ArchiveAnalyzer(Analyzer):
                         tmp_fh.write(data)
                         tmp_path = tmp_fh.name
                     nested_analyzer = ArchiveAnalyzer()
-                    nested = nested_analyzer.analyze(tmp_path, flag_pattern, "fast", ai_client)
+                    nested = nested_analyzer.analyze(
+                        tmp_path, flag_pattern, depth, ai_client,
+                        session=session, dispatcher_module=dispatcher_module,
+                    )
                     for f in nested:
                         f.title = f"[nested:{info.filename}] " + f.title
                     findings.extend(nested)
