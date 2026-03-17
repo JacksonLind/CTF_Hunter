@@ -90,6 +90,28 @@ for _idx, _ch in enumerate(_letters_polybius):
 # Internal timeout context
 # ---------------------------------------------------------------------------
 
+
+def _compile_session_flag_re(session: "Session") -> re.Pattern:
+    """Return a *bytes* regex compiled from ``session.flag_pattern``.
+
+    Falls back to the module-level :data:`_FLAG_RE` if the session attribute is
+    absent, empty, or contains an invalid regex pattern.  This ensures that the
+    caller's custom ``--flag`` pattern (or GUI-configured pattern) is honoured
+    everywhere inside :class:`ContentRedispatcher` rather than using the
+    hard-coded default.
+    """
+    raw = getattr(session, "flag_pattern", None)
+    if not raw:
+        return _FLAG_RE
+    # session.flag_pattern is a str; compile it as a bytes pattern so it can be
+    # used directly against raw bytes blobs inside _process / _unwrap.
+    try:
+        pattern_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
+        return re.compile(pattern_bytes)
+    except (re.error, UnicodeEncodeError):
+        return _FLAG_RE
+
+
 class _TimeoutContext:
     """Tracks the 45-second recursion budget for a single root ``process()`` call."""
 
@@ -201,7 +223,10 @@ class ContentRedispatcher:
             return []
 
         # ── Step A: classify ─────────────────────────────────────────────────
-        classification = self._classifier.classify(content)
+        # Compile the session's flag_pattern so classifier and sub-steps use the
+        # same (possibly custom) pattern rather than the module-level default.
+        flag_re = _compile_session_flag_re(session)
+        classification = self._classifier.classify(content, flag_re=flag_re)
         findings: list[Finding] = []
 
         # ── Step B: flag check ───────────────────────────────────────────────
@@ -224,7 +249,7 @@ class ContentRedispatcher:
             ))
 
         # ── Step C: encoding unwrap → recurse ────────────────────────────────
-        children = self._unwrap(content, classification)
+        children = self._unwrap(content, classification, flag_re=flag_re)
         for child in children:
             if ctx.expired:
                 ctx.skip()
@@ -243,7 +268,12 @@ class ContentRedispatcher:
     # Step C helpers                                                           #
     # ---------------------------------------------------------------------- #
 
-    def _unwrap(self, content: ExtractedContent, classification) -> list[ExtractedContent]:
+    def _unwrap(
+        self,
+        content: ExtractedContent,
+        classification,
+        flag_re: re.Pattern = _FLAG_RE,
+    ) -> list[ExtractedContent]:
         """Produce child ExtractedContent objects by decoding the detected encoding."""
         enc = classification.encoding_detected
         data = content.data
@@ -275,7 +305,7 @@ class ContentRedispatcher:
                 results.append(self._child(content, dec, "rot13"))
 
         elif enc == "caesar":
-            results.extend(self._try_all_caesar(content))
+            results.extend(self._try_all_caesar(content, flag_re=flag_re))
 
         elif enc == "vigenere":
             results.extend(self._try_vigenere(content))
@@ -315,14 +345,18 @@ class ContentRedispatcher:
                     break
 
         # XOR brute-force: always attempted on any blob
-        results.extend(self._try_xor_single(content))
+        results.extend(self._try_xor_single(content, flag_re=flag_re))
         results.extend(self._try_xor_multi(content))
 
         return [r for r in results if r is not None]
 
     # -- Caesar / ROT --
 
-    def _try_all_caesar(self, content: ExtractedContent) -> list[ExtractedContent]:
+    def _try_all_caesar(
+        self,
+        content: ExtractedContent,
+        flag_re: re.Pattern = _FLAG_RE,
+    ) -> list[ExtractedContent]:
         """Try all 25 Caesar shifts; return children that produce a flag match."""
         try:
             text = content.data.decode("ascii", errors="ignore")
@@ -332,7 +366,7 @@ class ContentRedispatcher:
         for shift in range(1, 26):
             shifted = _caesar_shift(text, shift)
             shifted_bytes = shifted.encode("ascii", errors="ignore")
-            if _FLAG_RE.search(shifted_bytes):
+            if flag_re.search(shifted_bytes):
                 child = self._child(content, shifted_bytes, f"caesar_{shift}")
                 if child:
                     children.append(child)
@@ -393,7 +427,11 @@ class ContentRedispatcher:
 
     # -- XOR single-byte brute-force --
 
-    def _try_xor_single(self, content: ExtractedContent) -> list[ExtractedContent]:
+    def _try_xor_single(
+        self,
+        content: ExtractedContent,
+        flag_re: re.Pattern = _FLAG_RE,
+    ) -> list[ExtractedContent]:
         """Try XOR with every possible single byte; recurse on best if score > 0.85."""
         data = content.data
         if not data:
@@ -403,7 +441,7 @@ class ContentRedispatcher:
         for key in range(256):
             dec = bytes(b ^ key for b in data)
             printable = sum(1 for b in dec if 0x20 <= b < 0x7F) / len(dec)
-            flag_bonus = 1.0 if _FLAG_RE.search(dec) else 0.0
+            flag_bonus = 1.0 if flag_re.search(dec) else 0.0
             combined = printable + flag_bonus
             if combined > best_score:
                 best_key, best_score, best_data = key, combined, dec

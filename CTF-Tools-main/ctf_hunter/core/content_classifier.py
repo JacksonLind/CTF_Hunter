@@ -149,7 +149,11 @@ class ContentClassifier:
     """Classify an :class:`~ctf_hunter.core.extracted_content.ExtractedContent`
     blob and return a :class:`ClassificationResult`."""
 
-    def classify(self, content: "ExtractedContent") -> ClassificationResult:
+    def classify(
+        self,
+        content: "ExtractedContent",
+        flag_re: "re.Pattern | None" = None,
+    ) -> ClassificationResult:
         data: bytes = content.data
 
         # ------------------------------------------------------------------ #
@@ -157,7 +161,8 @@ class ContentClassifier:
         #    preserved but classification continues through all remaining       #
         #    detection paths to determine proper MIME type and analyzers.       #
         # ------------------------------------------------------------------ #
-        flag_match = _check_flag(data)
+        flag_re = flag_re if flag_re is not None else _FLAG_RE
+        flag_match = _check_flag(data, flag_re)
 
         # ------------------------------------------------------------------ #
         # 1. Magic bytes                                                        #
@@ -192,7 +197,7 @@ class ContentClassifier:
                 text = data.decode("latin-1")
 
             encoding, enc_analyzers, enc_confidence = self._detect_text_encoding(
-                data, text, entropy
+                data, text, entropy, flag_re=flag_re
             )
             return ClassificationResult(
                 mime_type="text/plain",
@@ -261,7 +266,7 @@ class ContentClassifier:
     # ---------------------------------------------------------------------- #
 
     def _detect_text_encoding(
-        self, data: bytes, text: str, entropy: float
+        self, data: bytes, text: str, entropy: float, flag_re: re.Pattern = _FLAG_RE
     ) -> tuple[str, list[str], float]:
         """Detect text encoding; return (encoding_name, analyzers, confidence).
 
@@ -331,7 +336,7 @@ class ContentClassifier:
         if _IC_CAESAR_MIN <= ic <= _IC_CAESAR_MAX:
             # English-like IC – check if ROT13 reveals a flag first
             rot13 = text.translate(_ROT13_TABLE)
-            if _FLAG_RE.search(rot13.encode("utf-8", errors="ignore")):
+            if flag_re.search(rot13.encode("utf-8", errors="ignore")):
                 return "rot13", ["encoding", "classical_cipher"], 0.90
             return "caesar", ["classical_cipher", "encoding"], 0.75
 
@@ -340,7 +345,7 @@ class ContentClassifier:
 
         # High printable ratio but IC not recognised – last-chance ROT13 flag
         rot13 = text.translate(_ROT13_TABLE)
-        if _FLAG_RE.search(rot13.encode("utf-8", errors="ignore")):
+        if flag_re.search(rot13.encode("utf-8", errors="ignore")):
             return "rot13", ["encoding", "classical_cipher"], 0.90
 
         # Fallback
@@ -353,9 +358,9 @@ class ContentClassifier:
 # Module-level helpers (pure functions, no state)
 # ---------------------------------------------------------------------------
 
-def _check_flag(data: bytes) -> str:
+def _check_flag(data: bytes, flag_re: re.Pattern = _FLAG_RE) -> str:
     """Return the first flag-pattern match as a string, or empty string."""
-    m = _FLAG_RE.search(data)
+    m = flag_re.search(data)
     if m:
         try:
             return m.group(0).decode("utf-8", errors="replace")
