@@ -594,9 +594,71 @@ class EncodingAnalyzer(Analyzer):
                         confidence=0.60 if fm else 0.35,
                     ))
 
+        # Header context: force-attempt Base85 decode when file declares it
+        findings.extend(self._header_context_decode(path, flag_pattern))
+
         # Fuzzy encoding detector (deep mode or for unrecognized encoded-looking strings)
         if depth == "deep":
             findings.extend(self._fuzzy_detect(path, strings))
+
+        return findings
+
+    def _header_context_decode(self, path: str, flag_pattern: re.Pattern) -> List[Finding]:
+        """Scan the file as text for 'Encoding: ... base85' header lines and
+        force-attempt base64.b85decode() on the payload block that follows,
+        regardless of what the character-frequency heuristic would score.
+        """
+        findings: List[Finding] = []
+        try:
+            text = Path(path).read_text(errors="replace")
+        except Exception:
+            return findings
+
+        lines = text.splitlines()
+        i = 0
+        while i < len(lines):
+            if re.search(r"(?i)encoding[:\s]+.*base85", lines[i]):
+                # Found a base85 header context; collect the payload block below.
+                # Scan forward for an explicit "payload:" label within a small window.
+                payload_lines: List[str] = []
+                window_end = min(i + 20, len(lines))
+                payload_label_idx: Optional[int] = None
+                for k in range(i + 1, window_end):
+                    if re.match(r"(?i)payload\s*:", lines[k].strip()):
+                        payload_label_idx = k
+                        break
+
+                if payload_label_idx is not None:
+                    # Collect content lines after the "payload:" label
+                    j = payload_label_idx + 1
+                    while j < len(lines):
+                        stripped = lines[j].strip()
+                        if not stripped or re.match(r"^\[", stripped):
+                            break
+                        payload_lines.append(stripped)
+                        j += 1
+                else:
+                    # No explicit label: grab the first non-empty, non-header line
+                    for j in range(i + 1, window_end):
+                        stripped = lines[j].strip()
+                        if stripped and not re.match(r"^\[", stripped):
+                            payload_lines.append(stripped)
+                            break
+
+                payload = "".join(payload_lines)
+                if payload:
+                    decoded = _decode_base85(payload)
+                    if decoded and _is_printable(decoded):
+                        fm = self._check_flag(decoded, flag_pattern)
+                        findings.append(self._finding(
+                            path,
+                            "Base85 force-decoded (header context)",
+                            f"Encoding header triggered Base85 decode → {decoded[:200]}",
+                            severity="HIGH" if fm else "MEDIUM",
+                            flag_match=fm,
+                            confidence=0.85 if fm else 0.60,
+                        ))
+            i += 1
 
         return findings
 

@@ -406,8 +406,20 @@ def _r30_ctf_framework_strings(findings: List[Finding]):
     return None
 
 
+# Rule 31
+def _r31_inline_pipeline_declaration(findings: List[Finding]):
+    """Match an 'Encoding: <pipeline>' inline declaration found in findings."""
+    pipeline_hits = _matches_title(findings, [
+        "base85 force-decoded", "base85", "pipeline", "encoding header",
+        "inline pipeline", "encoding:",
+    ])
+    if pipeline_hits:
+        return (_conf(len(pipeline_hits), weak=0.55, strong=0.88), pipeline_hits)
+    return None
+
+
 # ---------------------------------------------------------------------------
-# _RULES list  (30 rules)
+# _RULES list  (31 rules)
 # ---------------------------------------------------------------------------
 
 _RULES: List[_Rule] = [
@@ -827,6 +839,27 @@ _RULES: List[_Rule] = [
             "[print(m) for m in matches]\"",
         ],
         transforms=["strings-filter", "regex-extract"],
+    ),
+    # 31
+    _Rule(
+        title="Inline Encoding pipeline declaration — apply declared transform chain",
+        category="encoding",
+        match_fn=_r31_inline_pipeline_declaration,
+        missing=[
+            "Parse 'Encoding:' header to extract transform sequence",
+            "Apply each transform step in order (base85 → binary → reverse → atbash, etc.)",
+        ],
+        commands=[
+            "python3 -c \""
+            "import base64; payload=open('challenge.txt').read().split('payload:',1)[1].strip().split()[0]; "
+            "print(base64.b85decode(payload))\"",
+            "python3 -c \""
+            "import base64, re; "
+            "data=open('challenge.txt').read(); "
+            "p=re.search(r'payload:\\s*([^\\n]+)', data); "
+            "print(base64.b85decode(p.group(1).strip()) if p else 'not found')\"",
+        ],
+        transforms=["base85-decode", "binary-decode", "reverse", "atbash-decode"],
     ),
 ]
 
