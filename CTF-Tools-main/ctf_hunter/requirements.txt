@@ -15,6 +15,7 @@ pyinstaller>=6.0.0
 bcrypt>=4.0.0
 scipy>=1.11.0
 imageio-ffmpeg>=0.4.9
+pytesseract>=0.3.10
 # Optional: dynamic Frida instrumentation (Task 4). Remove the leading '#' to install.
 # frida>=16.0.0
 # frida-tools>=12.0.0
