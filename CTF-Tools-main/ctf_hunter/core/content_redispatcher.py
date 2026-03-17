@@ -349,6 +349,18 @@ class ContentRedispatcher:
                         results.append(child)
                     break
 
+        # Space-binary: always attempted unconditionally.
+        # ContentClassifier may label a space-separated binary blob as "binary"
+        # or "unknown" (because _try_binary previously stripped spaces), so we
+        # cannot rely solely on enc == "space_binary".  Attempting it here
+        # ensures the decode fires even when classification misses it.
+        if enc != "space_binary":   # avoid double-processing if classifier caught it
+            dec = _try_space_binary(data)
+            if dec:
+                child = self._child(content, dec, "space_binary")
+                if child:
+                    results.append(child)
+
         # XOR brute-force: always attempted on any blob
         results.extend(self._try_xor_single(content, flag_re=flag_re))
         results.extend(self._try_xor_multi(content))
@@ -605,9 +617,19 @@ def _try_hex(data: bytes) -> Optional[bytes]:
 
 
 def _try_binary(data: bytes) -> Optional[bytes]:
-    """Convert a compact (no-space) binary string to bytes."""
+    """Convert a compact (no-space) binary string to bytes.
+
+    Explicitly rejects space-separated binary (e.g. "01001000 01101001") so that
+    _try_space_binary can handle that format.  Previously this function stripped
+    all whitespace before validating, which caused it to silently consume
+    space-binary blobs and produce incorrectly-lengthed output — preventing the
+    space_binary classifier branch from ever being reached.
+    """
     text = data.decode("ascii", errors="ignore").strip()
-    bits = text.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
+    # Reject if the input contains spaces — that's space-binary, handled separately
+    if " " in text:
+        return None
+    bits = text.replace("\n", "").replace("\r", "").replace("\t", "")
     if not bits or len(bits) % 8 != 0 or not set(bits) <= {"0", "1"}:
         return None
     return bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
