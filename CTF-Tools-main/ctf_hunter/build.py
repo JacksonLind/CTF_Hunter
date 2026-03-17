@@ -77,6 +77,14 @@ def main() -> None:
         "--specpath", str(build_path),
         "--add-data", f"{ROOT / 'wordlists'}{os.pathsep}wordlists",
         "--paths", str(ROOT),
+        # imageio-ffmpeg: collect the entire package including the bundled
+        # ffmpeg binary that lives in imageio_ffmpeg/binaries/.
+        # Without --collect-data the binary is excluded and get_ffmpeg_exe()
+        # raises FileNotFoundError at runtime inside the frozen exe.
+        "--collect-data", "imageio_ffmpeg",
+        "--hidden-import", "imageio_ffmpeg",
+        # Runtime hook fixes get_ffmpeg_exe() path resolution in the frozen exe
+        "--runtime-hook", str(ROOT / "hook_imageio_ffmpeg.py"),
         str(ROOT / "main.py"),
     ]
 
