@@ -287,8 +287,9 @@ class ContentClassifier:
         # Must come before hex: '0' and '1' are valid hex digits.
 
         # Space-separated 8-bit binary (checked before compact binary so the two
-        # encodings are routed independently).
-        if re.fullmatch(r'[01]{8}( [01]{8})+', stripped):
+        # encodings are routed independently).  Pattern mirrors SPACE_BINARY_RE
+        # defined in analyzers/encoding.py — keep the two in sync.
+        if re.fullmatch(r'[01]{8}(\s[01]{8})+', stripped):
             return "space_binary", ["encoding", "classical_cipher"], 0.87
 
         bin_ratio = sum(1 for c in stripped if ord(c) in _BINARY_CHARS) / n

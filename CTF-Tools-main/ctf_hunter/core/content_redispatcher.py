@@ -624,11 +624,14 @@ def _try_space_binary(data: bytes) -> Optional[bytes]:
     Each space-delimited token must be exactly 8 binary digits (0 or 1).
     Returns the decoded bytes, or *None* if the input does not match the pattern.
     """
-    text = data.decode("ascii", errors="ignore").strip()
-    groups = text.split(" ")
-    if not groups or not all(len(g) == 8 and set(g) <= {"0", "1"} for g in groups):
+    stripped = data.strip()
+    if not _SPACE_BINARY_RE.match(stripped):
         return None
-    return bytes(int(g, 2) for g in groups)
+    groups = stripped.decode("ascii").split(" ")
+    try:
+        return bytes(int(g, 2) for g in groups)
+    except Exception:
+        return None
 
 
 def _try_morse(data: bytes) -> Optional[bytes]:
