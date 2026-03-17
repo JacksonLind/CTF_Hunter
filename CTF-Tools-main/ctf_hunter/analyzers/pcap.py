@@ -6,13 +6,16 @@ Uses scapy with tshark fallback.
 """
 from __future__ import annotations
 
+import bisect
+import mmap
 import re
+import struct
 import base64
 import binascii
 import string
 from collections import defaultdict, Counter
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from core.report import Finding
 from core.ai_client import AIClient
@@ -80,6 +83,10 @@ class PcapAnalyzer(Analyzer):
 
         # DNS covert channel detection (always run)
         findings.extend(self._detect_dns_covert_channel(path, packets, flag_pattern))
+
+        # pcapng merge metadata + covert timing channel (always run, raw binary)
+        findings.extend(self._parse_pcapng_metadata(path, flag_pattern))
+        findings.extend(self._timing_channel_analysis(path, flag_pattern))
 
         self._run_redispatch_hook(findings, session, dispatcher_module)
         return findings
@@ -423,6 +430,339 @@ class PcapAnalyzer(Analyzer):
             labels.append(data[offset:end].decode("latin-1", errors="replace"))
             offset = end
         return ".".join(labels) if labels else None
+
+    # ------------------------------------------------------------------
+    # pcapng metadata parser — merge comments + interface packet counts
+    # ------------------------------------------------------------------
+
+    def _parse_pcapng_metadata(self, path: str, flag_pattern: re.Pattern) -> List[Finding]:
+        """Parse raw pcapng binary for Section Header Block capture comments
+        and per-interface packet counts.
+
+        Reads only block headers and option fields — never loads packet
+        payloads — so it is safe on files up to several GB.  Uses mmap for
+        zero-copy access.
+        """
+        findings: List[Finding] = []
+        try:
+            file_size = Path(path).stat().st_size
+            if file_size < 28:
+                return findings
+            with open(path, "rb") as fh:
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+                try:
+                    findings.extend(self._pcapng_scan(path, mm, file_size, flag_pattern))
+                finally:
+                    mm.close()
+        except Exception:
+            pass
+        return findings
+
+    def _pcapng_scan(
+        self,
+        path: str,
+        mm: mmap.mmap,
+        file_size: int,
+        flag_pattern: re.Pattern,
+    ) -> List[Finding]:
+        findings: List[Finding] = []
+
+        # Block type constants
+        SHB  = 0x0A0D0D0A  # Section Header Block
+        IDB  = 0x00000001  # Interface Description Block
+        EPB  = 0x00000006  # Enhanced Packet Block
+        OPT_COMMENT = 0x0003
+        OPT_ENDOFOPT = 0x0000
+
+        # Check byte order from SHB byte-order magic
+        if file_size < 12:
+            return findings
+        shb_bom = struct.unpack_from("<I", mm, 8)[0]
+        endian = "<" if shb_bom == 0x1A2B3C4D else ">"
+
+        iface_count   = 0
+        iface_packets: Dict[int, int] = {}
+        capture_comments: List[str] = []
+        pos = 0
+
+        while pos + 8 <= file_size:
+            bt = struct.unpack_from(f"{endian}I", mm, pos)[0]
+            bl = struct.unpack_from(f"{endian}I", mm, pos + 4)[0]
+            if bl < 12 or pos + bl > file_size:
+                break
+
+            if bt == SHB:
+                # Scan options inside SHB for capture comment (code 0x0003)
+                opt_pos = pos + 28  # skip type(4) + len(4) + bom(4) + maj(2) + min(2) + sec_len(8)
+                opt_end = pos + bl - 4  # exclude trailing block-total-length
+                while opt_pos + 4 <= opt_end:
+                    opt_code = struct.unpack_from(f"{endian}H", mm, opt_pos)[0]
+                    opt_len  = struct.unpack_from(f"{endian}H", mm, opt_pos + 2)[0]
+                    if opt_code == OPT_ENDOFOPT:
+                        break
+                    if opt_code == OPT_COMMENT and opt_len > 0:
+                        raw_opt = opt_pos + 4
+                        if raw_opt + opt_len <= opt_end:
+                            comment = mm[raw_opt: raw_opt + opt_len].decode("utf-8", errors="replace")
+                            capture_comments.append(comment)
+                    # Options are padded to 4-byte boundary
+                    opt_pos += 4 + opt_len + (4 - opt_len % 4) % 4
+
+            elif bt == IDB:
+                iface_packets[iface_count] = 0
+                iface_count += 1
+
+            elif bt == EPB:
+                if bl >= 12:
+                    iface_id = struct.unpack_from(f"{endian}I", mm, pos + 8)[0]
+                    iface_packets[iface_id] = iface_packets.get(iface_id, 0) + 1
+
+            pos += bl
+
+        # Emit capture comment findings
+        for comment in capture_comments:
+            lines = comment.strip().splitlines()
+            merged_files = [l.strip() for l in lines if re.match(r"File\d+\s*:", l, re.IGNORECASE)]
+            covert_hints = [
+                f for f in merged_files
+                if re.search(r"covert|timing|hidden|steg|secret", f, re.IGNORECASE)
+            ]
+            detail = f"Capture comment:\n{comment[:800]}"
+            if merged_files:
+                detail += f"\n\nMerged source files detected:\n" + "\n".join(merged_files)
+            findings.append(self._finding(
+                path,
+                f"pcapng capture comment ({len(merged_files)} merged file(s) detected)",
+                detail,
+                severity="HIGH" if merged_files else "INFO",
+                confidence=0.85 if merged_files else 0.50,
+            ))
+            if covert_hints:
+                findings.append(self._finding(
+                    path,
+                    "Covert channel filename in pcapng merge comment",
+                    "Suspicious filename(s): " + "; ".join(covert_hints),
+                    severity="HIGH",
+                    confidence=0.92,
+                ))
+
+        # Emit per-interface packet count findings
+        if iface_packets:
+            total = sum(iface_packets.values())
+            summary = ", ".join(
+                f"iface#{i}={c}" for i, c in sorted(iface_packets.items())
+            )
+            findings.append(self._finding(
+                path,
+                f"pcapng interface packet counts ({iface_count} interface(s), {total} total)",
+                summary,
+                severity="INFO",
+                confidence=0.70,
+            ))
+            # Flag low-volume interfaces as covert candidates
+            if total > 0:
+                for iface_id, count in iface_packets.items():
+                    ratio = count / total
+                    if 50 <= count <= 5000 and ratio < 0.01:
+                        findings.append(self._finding(
+                            path,
+                            f"Low-volume interface #{iface_id} — likely covert candidate",
+                            f"{count} packets ({ratio*100:.4f}% of total {total})",
+                            severity="HIGH",
+                            confidence=0.88,
+                        ))
+
+        return findings
+
+    # ------------------------------------------------------------------
+    # Covert timing channel detector
+    # ------------------------------------------------------------------
+
+    def _timing_channel_analysis(self, path: str, flag_pattern: re.Pattern) -> List[Finding]:
+        """Extract per-interface packet timestamps from pcapng and detect
+        quantised inter-arrival timing channels.
+
+        Supports:
+        - 2-value binary encoding (long=1, short=0)
+        - 4-value base-4 encoding (2 bits per symbol)
+        - MSB-first and LSB-first bit ordering
+        - Single leading framing-bit alignment fix
+        Uses mmap + struct for performance on large captures.
+        """
+        findings: List[Finding] = []
+        try:
+            file_size = Path(path).stat().st_size
+            if file_size < 28:
+                return findings
+            with open(path, "rb") as fh:
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+                try:
+                    findings.extend(self._timing_scan(path, mm, file_size, flag_pattern))
+                finally:
+                    mm.close()
+        except Exception:
+            pass
+        return findings
+
+    def _timing_scan(
+        self,
+        path: str,
+        mm: mmap.mmap,
+        file_size: int,
+        flag_pattern: re.Pattern,
+    ) -> List[Finding]:
+        findings: List[Finding] = []
+
+        EPB    = 0x00000006
+        IDB    = 0x00000001
+        shb_bom = struct.unpack_from("<I", mm, 8)[0]
+        endian  = "<" if shb_bom == 0x1A2B3C4D else ">"
+
+        # ts_resol per interface (default 1e-6 = microseconds)
+        iface_tsresol: Dict[int, float] = {}
+        iface_times:   Dict[int, List[float]] = defaultdict(list)
+        iface_count = 0
+        pos = 0
+
+        while pos + 8 <= file_size:
+            bt = struct.unpack_from(f"{endian}I", mm, pos)[0]
+            bl = struct.unpack_from(f"{endian}I", mm, pos + 4)[0]
+            if bl < 12 or pos + bl > file_size:
+                break
+
+            if bt == IDB:
+                # Default tsresol is microseconds (10^-6)
+                iface_tsresol[iface_count] = 1e-6
+                iface_count += 1
+
+            elif bt == EPB and bl >= 20:
+                iface_id = struct.unpack_from(f"{endian}I", mm, pos + 8)[0]
+                ts_high  = struct.unpack_from(f"{endian}I", mm, pos + 12)[0]
+                ts_low   = struct.unpack_from(f"{endian}I", mm, pos + 16)[0]
+                ts_raw   = (ts_high << 32) | ts_low
+                resol    = iface_tsresol.get(iface_id, 1e-6)
+                iface_times[iface_id].append(ts_raw * resol)
+
+            pos += bl
+
+        for iface_id, times in iface_times.items():
+            n = len(times)
+            if not (50 <= n <= 5000):
+                continue
+
+            times_sorted = sorted(times)
+            deltas = [
+                round(times_sorted[i] - times_sorted[i - 1], 6)
+                for i in range(1, len(times_sorted))
+                if times_sorted[i] - times_sorted[i - 1] > 1e-9
+            ]
+            if len(deltas) < 8:
+                continue
+
+            distinct = sorted(set(deltas))
+
+            if len(distinct) == 2:
+                findings.extend(
+                    self._decode_binary_timing(
+                        path, iface_id, deltas, distinct, flag_pattern
+                    )
+                )
+            elif len(distinct) in (3, 4):
+                findings.extend(
+                    self._decode_basen_timing(
+                        path, iface_id, deltas, distinct, flag_pattern
+                    )
+                )
+
+        return findings
+
+    def _decode_binary_timing(
+        self,
+        path: str,
+        iface_id: int,
+        deltas: List[float],
+        distinct: List[float],
+        flag_pattern: re.Pattern,
+    ) -> List[Finding]:
+        """Decode a 2-value timing channel: larger delta = 1, smaller = 0."""
+        findings: List[Finding] = []
+        short_val, long_val = distinct[0], distinct[1]
+        bits = [1 if d == long_val else 0 for d in deltas]
+
+        candidates: List[Tuple[str, List[int]]] = [
+            ("raw",         bits),
+            ("framing+0",   [0] + bits),
+            ("framing+1",   [1] + bits),
+        ]
+
+        for label, bit_seq in candidates:
+            # Pad to byte boundary
+            remainder = len(bit_seq) % 8
+            padded = bit_seq + [0] * ((8 - remainder) % 8) if remainder else bit_seq
+            for order, rev in (("MSB", False), ("LSB", True)):
+                decoded = self._bits_to_ascii(padded, lsb_first=rev)
+                if decoded and self._is_printable_ascii(decoded):
+                    fm = self._check_flag(decoded, flag_pattern)
+                    findings.append(self._finding(
+                        path,
+                        f"Covert timing channel decoded — iface#{iface_id} "
+                        f"({label}, {order}-first)",
+                        f"Short={short_val}s=0  Long={long_val}s=1\n"
+                        f"{len(deltas)} deltas → {len(padded)//8} bytes\n"
+                        f"Decoded: {decoded[:300]}",
+                        severity="HIGH" if fm else "MEDIUM",
+                        flag_match=fm,
+                        confidence=0.97 if fm else 0.80,
+                    ))
+        return findings
+
+    def _decode_basen_timing(
+        self,
+        path: str,
+        iface_id: int,
+        deltas: List[float],
+        distinct: List[float],
+        flag_pattern: re.Pattern,
+    ) -> List[Finding]:
+        """Decode a 3–4 value timing channel as base-N symbols."""
+        findings: List[Finding] = []
+        if len(distinct) == 4:
+            # 2 bits per symbol
+            sym_map = {v: i for i, v in enumerate(distinct)}
+            bits: List[int] = []
+            for d in deltas:
+                sym = sym_map.get(d, 0)
+                bits += [(sym >> 1) & 1, sym & 1]
+            padded = bits + [0] * ((8 - len(bits) % 8) % 8)
+            for order, rev in (("MSB", False), ("LSB", True)):
+                decoded = self._bits_to_ascii(padded, lsb_first=rev)
+                if decoded and self._is_printable_ascii(decoded):
+                    fm = self._check_flag(decoded, flag_pattern)
+                    findings.append(self._finding(
+                        path,
+                        f"Covert timing channel (base-4) decoded — iface#{iface_id} ({order}-first)",
+                        f"Symbol map: {sym_map}\nDecoded: {decoded[:300]}",
+                        severity="HIGH" if fm else "MEDIUM",
+                        flag_match=fm,
+                        confidence=0.95 if fm else 0.75,
+                    ))
+        return findings
+
+    @staticmethod
+    def _bits_to_ascii(bits: List[int], lsb_first: bool = False) -> Optional[str]:
+        """Convert a flat list of bits to an ASCII string, 8 bits per char."""
+        result = []
+        for i in range(0, len(bits) - 7, 8):
+            byte_bits = bits[i: i + 8]
+            if lsb_first:
+                byte_bits = byte_bits[::-1]
+            val = int("".join(str(b) for b in byte_bits), 2)
+            if 0x20 <= val < 0x7F or val in (0x09, 0x0A, 0x0D):
+                result.append(chr(val))
+            else:
+                result.append("\x00")
+        text = "".join(result)
+        return text if text.strip("\x00") else None
 
     # ------------------------------------------------------------------
     # Decode helpers
