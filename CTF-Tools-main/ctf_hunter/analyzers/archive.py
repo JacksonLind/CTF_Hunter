@@ -14,6 +14,9 @@ from core.ai_client import AIClient
 from .base import Analyzer
 
 _WORDLIST_PATH = Path(__file__).parent.parent / "wordlists" / "rockyou_top1000.txt"
+# Maximum recursion depth for nested archive extraction. Prevents infinite
+# recursion when a ZIP contains another ZIP (or a self-referential archive).
+_MAX_NEST_DEPTH = 5
 
 
 class ArchiveAnalyzer(Analyzer):
@@ -25,6 +28,7 @@ class ArchiveAnalyzer(Analyzer):
         ai_client: Optional[AIClient],
         session=None,
         dispatcher_module=None,
+        _nest_depth: int = 0,
     ) -> List[Finding]:
         findings: List[Finding] = []
 
@@ -42,10 +46,11 @@ class ArchiveAnalyzer(Analyzer):
                 # Path traversal
                 findings.extend(self._check_path_traversal(path, zf))
                 # Nested archives
-                if depth == "deep":
+                if depth == "deep" and _nest_depth < _MAX_NEST_DEPTH:
                     findings.extend(self._check_nested(
                         path, zf, flag_pattern, ai_client,
                         depth=depth, session=session, dispatcher_module=dispatcher_module,
+                        _nest_depth=_nest_depth,
                     ))
         except (zipfile.BadZipFile, Exception) as exc:
             findings.append(self._finding(
@@ -194,6 +199,7 @@ class ArchiveAnalyzer(Analyzer):
         depth: str = "deep",
         session=None,
         dispatcher_module=None,
+        _nest_depth: int = 0,
     ) -> List[Finding]:
         import tempfile
         findings: List[Finding] = []
@@ -209,6 +215,7 @@ class ArchiveAnalyzer(Analyzer):
                     nested = nested_analyzer.analyze(
                         tmp_path, flag_pattern, depth, ai_client,
                         session=session, dispatcher_module=dispatcher_module,
+                        _nest_depth=_nest_depth + 1,
                     )
                     for f in nested:
                         f.title = f"[nested:{info.filename}] " + f.title
