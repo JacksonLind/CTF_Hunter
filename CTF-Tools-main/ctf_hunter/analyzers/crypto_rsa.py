@@ -595,7 +595,7 @@ class CryptoRSAAnalyzer(Analyzer):
                 e1, e2 = k1.get("e", 0), k2.get("e", 0)
                 if e1 and e2 and e1 != e2:
                     c1 = k1.get("ciphertext") or self._extract_ciphertext(raw, n)
-                    c2 = k2.get("ciphertext")
+                    c2 = k2.get("ciphertext") or self._extract_ciphertext(raw, n)
                     if c1 and c2 and c1 != c2:
                         # Distinct ciphertexts available — attempt the attack
                         m = _common_modulus_attack(n, e1, e2, c1, c2)

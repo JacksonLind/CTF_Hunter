@@ -136,17 +136,14 @@ def _md4_pure(data: bytes) -> str:
     for i in range(0, len(msg), 64):
         X = list(struct.unpack_from("<16I", msg, i))
         a, b, c, d = A, B, C, D
-        for j in [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15]:
+        for j in range(16):
             a = _rol((a + _f(b, c, d) + X[j]) & 0xFFFFFFFF, [3, 7, 11, 19][j % 4])
             a, b, c, d = d, a, b, c
-        for k, s_vals in [
-            ([0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15], [3, 5, 9, 13]),
-        ]:
-            for j in k:
-                a = _rol((a + _g(b, c, d) + X[j] + 0x5A827999) & 0xFFFFFFFF, s_vals[j % 4])
-                a, b, c, d = d, a, b, c
-        for j in [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15]:
-            a = _rol((a + _h(b, c, d) + X[j] + 0x6ED9EBA1) & 0xFFFFFFFF, [3, 9, 11, 15][j % 4])
+        for idx, j in enumerate([0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15]):
+            a = _rol((a + _g(b, c, d) + X[j] + 0x5A827999) & 0xFFFFFFFF, [3, 5, 9, 13][idx % 4])
+            a, b, c, d = d, a, b, c
+        for idx, j in enumerate([0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15]):
+            a = _rol((a + _h(b, c, d) + X[j] + 0x6ED9EBA1) & 0xFFFFFFFF, [3, 9, 11, 15][idx % 4])
             a, b, c, d = d, a, b, c
         A = (A + a) & 0xFFFFFFFF
         B = (B + b) & 0xFFFFFFFF
