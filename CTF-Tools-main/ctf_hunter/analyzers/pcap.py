@@ -24,6 +24,9 @@ from .base import Analyzer
 
 
 class PcapAnalyzer(Analyzer):
+    # Files larger than this skip scapy to avoid OOM on multi-GB captures.
+    _SCAPY_SIZE_LIMIT = 200 * 1024 * 1024  # 200 MB
+
     def analyze(
         self,
         path: str,
@@ -34,6 +37,29 @@ class PcapAnalyzer(Analyzer):
         dispatcher_module=None,
     ) -> List[Finding]:
         findings: List[Finding] = []
+
+        # Raw binary passes run unconditionally — safe on files of any size.
+        findings.extend(self._parse_pcapng_metadata(path, flag_pattern))
+        findings.extend(self._timing_channel_analysis(path, flag_pattern))
+
+        # Skip scapy for large captures to avoid OOM.
+        try:
+            file_size = Path(path).stat().st_size
+        except Exception:
+            file_size = 0
+        if file_size > self._SCAPY_SIZE_LIMIT:
+            tshark_data = run_tshark(path)
+            if tshark_data:
+                findings.append(self._finding(
+                    path,
+                    f"Large PCAP ({file_size // (1024*1024)} MB) — tshark summary only",
+                    str(tshark_data[:5]),
+                    severity="INFO",
+                    confidence=0.4,
+                ))
+            self._run_redispatch_hook(findings, session, dispatcher_module)
+            return findings
+
         try:
             from scapy.all import rdpcap, TCP, UDP, IP, Raw, Ether
             packets = rdpcap(path)
@@ -84,9 +110,9 @@ class PcapAnalyzer(Analyzer):
         # DNS covert channel detection (always run)
         findings.extend(self._detect_dns_covert_channel(path, packets, flag_pattern))
 
-        # pcapng merge metadata + covert timing channel (always run, raw binary)
-        findings.extend(self._parse_pcapng_metadata(path, flag_pattern))
-        findings.extend(self._timing_channel_analysis(path, flag_pattern))
+        # Scapy-based timing analysis for legacy .pcap files (non-pcapng).
+        # The raw binary pass above covers pcapng; this covers the rest.
+        findings.extend(self._timing_channel_scapy(path, packets, flag_pattern))
 
         self._run_redispatch_hook(findings, session, dispatcher_module)
         return findings
@@ -613,12 +639,68 @@ class PcapAnalyzer(Analyzer):
     ) -> List[Finding]:
         findings: List[Finding] = []
 
-        EPB    = 0x00000006
-        IDB    = 0x00000001
+        # Detect format: pcapng starts with SHB magic 0x0A0D0D0A;
+        # legacy pcap starts with 0xd4c3b2a1 (LE) or 0xa1b2c3d4 (BE).
+        if file_size < 24:
+            return findings
+        magic = struct.unpack_from("<I", mm, 0)[0]
+
+        PCAP_LE_MAGIC = 0xD4C3B2A1
+        PCAP_BE_MAGIC = 0xA1B2C3D4
+        SHB_MAGIC     = 0x0A0D0D0A
+
+        if magic in (PCAP_LE_MAGIC, PCAP_BE_MAGIC):
+            iface_times = self._extract_times_legacy_pcap(mm, file_size, magic)
+        elif magic == SHB_MAGIC:
+            iface_times = self._extract_times_pcapng(mm, file_size)
+        else:
+            return findings
+
+        for iface_id, times in iface_times.items():
+            if len(times) < 10:
+                continue
+
+            # Preserve packet arrival order; filter sub-nanosecond noise.
+            deltas = [
+                times[i] - times[i - 1]
+                for i in range(1, len(times))
+                if times[i] - times[i - 1] > 1e-9
+            ]
+            if len(deltas) < 8:
+                continue
+
+            centers, delta_map = self._cluster_deltas(deltas)
+            clustered = [delta_map[d] for d in deltas]
+
+            if len(centers) == 2:
+                findings.extend(
+                    self._decode_binary_timing(
+                        path, iface_id, clustered, centers, flag_pattern
+                    )
+                )
+            elif len(centers) in (3, 4):
+                findings.extend(
+                    self._decode_basen_timing(
+                        path, iface_id, clustered, centers, flag_pattern
+                    )
+                )
+
+        return findings
+
+    # ------------------------------------------------------------------
+    # Timestamp extraction helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_times_pcapng(
+        mm: mmap.mmap, file_size: int
+    ) -> Dict[int, List[float]]:
+        """Extract per-interface arrival timestamps from a pcapng file."""
+        EPB = 0x00000006
+        IDB = 0x00000001
         shb_bom = struct.unpack_from("<I", mm, 8)[0]
         endian  = "<" if shb_bom == 0x1A2B3C4D else ">"
 
-        # ts_resol per interface (default 1e-6 = microseconds)
         iface_tsresol: Dict[int, float] = {}
         iface_times:   Dict[int, List[float]] = defaultdict(list)
         iface_count = 0
@@ -629,52 +711,171 @@ class PcapAnalyzer(Analyzer):
             bl = struct.unpack_from(f"{endian}I", mm, pos + 4)[0]
             if bl < 12 or pos + bl > file_size:
                 break
-
             if bt == IDB:
-                # Default tsresol is microseconds (10^-6)
-                iface_tsresol[iface_count] = 1e-6
+                iface_tsresol[iface_count] = 1e-6  # default: microseconds
                 iface_count += 1
-
             elif bt == EPB and bl >= 20:
                 iface_id = struct.unpack_from(f"{endian}I", mm, pos + 8)[0]
                 ts_high  = struct.unpack_from(f"{endian}I", mm, pos + 12)[0]
                 ts_low   = struct.unpack_from(f"{endian}I", mm, pos + 16)[0]
-                ts_raw   = (ts_high << 32) | ts_low
                 resol    = iface_tsresol.get(iface_id)
-                if resol is None:
-                    pos += bl
-                    continue
-                iface_times[iface_id].append(ts_raw * resol)
-
+                if resol is not None:
+                    iface_times[iface_id].append(((ts_high << 32) | ts_low) * resol)
             pos += bl
 
-        for iface_id, times in iface_times.items():
-            n = len(times)
-            if n < 10:
+        return dict(iface_times)
+
+    @staticmethod
+    def _extract_times_legacy_pcap(
+        mm: mmap.mmap, file_size: int, magic: int
+    ) -> Dict[int, List[float]]:
+        """Extract packet arrival timestamps from a legacy libpcap file.
+
+        All packets belong to interface 0 in this format.
+        """
+        endian = "<" if magic == 0xD4C3B2A1 else ">"
+        if file_size < 24:
+            return {}
+        # Global header: magic(4) + ver_maj(2) + ver_min(2) + thiszone(4)
+        #                + sigfigs(4) + snaplen(4) + network(4) = 24 bytes
+        pos = 24
+        times: List[float] = []
+        while pos + 16 <= file_size:
+            ts_sec  = struct.unpack_from(f"{endian}I", mm, pos)[0]
+            ts_usec = struct.unpack_from(f"{endian}I", mm, pos + 4)[0]
+            incl_len = struct.unpack_from(f"{endian}I", mm, pos + 8)[0]
+            times.append(ts_sec + ts_usec * 1e-6)
+            pos += 16 + incl_len
+        return {0: times} if times else {}
+
+    @staticmethod
+    def _cluster_deltas(
+        deltas: List[float],
+        merge_threshold: float = 0.20,
+    ) -> Tuple[List[float], Dict[float, float]]:
+        """Cluster raw delta values into distinct buckets via iterative merging.
+
+        Two adjacent sorted values are merged when their difference is within
+        ``merge_threshold`` (20 % by default) of the smaller value.  Returns
+        (cluster_centers, {raw_delta -> nearest_center}).
+        """
+        unique: List[float] = sorted(set(deltas))
+        if len(unique) <= 1:
+            return unique, {v: v for v in unique}
+
+        changed = True
+        while changed:
+            changed = False
+            merged: List[float] = []
+            i = 0
+            while i < len(unique):
+                if (
+                    i + 1 < len(unique)
+                    and (unique[i + 1] - unique[i]) <= merge_threshold * unique[i]
+                ):
+                    merged.append((unique[i] + unique[i + 1]) / 2.0)
+                    i += 2
+                    changed = True
+                else:
+                    merged.append(unique[i])
+                    i += 1
+            unique = merged
+
+        mapping: Dict[float, float] = {
+            d: min(unique, key=lambda c: abs(c - d)) for d in deltas
+        }
+        return unique, mapping
+
+    def _timing_channel_scapy(
+        self,
+        path: str,
+        packets,
+        flag_pattern: re.Pattern,
+    ) -> List[Finding]:
+        """Timing channel analysis using already-loaded scapy packets.
+
+        Covers legacy .pcap files where _timing_channel_analysis (raw binary)
+        produces no results because the file is not in pcapng format.
+        Groups packets by (src_ip, dst_ip, dport) to isolate per-flow timing,
+        then runs the same bimodal / base-4 detection on each flow.
+        Only fires for flows with < 10 % of total packets (covert candidate
+        heuristic) or when less than 3 distinct flows exist overall.
+        """
+        findings: List[Finding] = []
+        try:
+            from scapy.all import IP, UDP, TCP
+        except Exception:
+            return findings
+
+        # Check if the raw binary pass already found timing results — if so,
+        # don't double-report.  We detect this by checking whether
+        # _timing_channel_analysis already returned findings (not possible
+        # directly here), so we use a lightweight pcapng magic check instead.
+        try:
+            with open(path, "rb") as fh:
+                first4 = fh.read(4)
+            if struct.unpack_from("<I", first4, 0)[0] == 0x0A0D0D0A:
+                return findings  # already handled by raw binary pass
+        except Exception:
+            pass
+
+        # Build per-flow timestamp lists.
+        flow_times: Dict[tuple, List[float]] = defaultdict(list)
+        all_times: List[float] = []
+        for pkt in packets:
+            t = float(getattr(pkt, "time", 0))
+            all_times.append(t)
+            try:
+                if pkt.haslayer(IP):
+                    if pkt.haslayer(TCP):
+                        key = (pkt[IP].src, pkt[IP].dst, pkt[TCP].dport)
+                    elif pkt.haslayer(UDP):
+                        key = (pkt[IP].src, pkt[IP].dst, pkt[UDP].dport)
+                    else:
+                        key = (pkt[IP].src, pkt[IP].dst, 0)
+                    flow_times[key].append(t)
+            except Exception:
+                pass
+
+        total = len(all_times)
+        if total < 10:
+            return findings
+
+        # Analyse each flow; also analyse all packets together as iface 0.
+        candidates: List[Tuple[object, List[float]]] = list(flow_times.items())
+        candidates.append(("all", sorted(all_times)))
+
+        for flow_key, times in candidates:
+            if len(times) < 10:
+                continue
+            # Covert heuristic: only analyse small flows unless it's the all-packets group.
+            if flow_key != "all" and len(times) / max(total, 1) > 0.10:
                 continue
 
-            times_sorted = sorted(times)
+            times_s = sorted(times)
             deltas = [
-                round(times_sorted[i] - times_sorted[i - 1], 6)
-                for i in range(1, len(times_sorted))
-                if times_sorted[i] - times_sorted[i - 1] > 1e-9
+                times_s[i] - times_s[i - 1]
+                for i in range(1, len(times_s))
+                if times_s[i] - times_s[i - 1] > 1e-9
             ]
             if len(deltas) < 8:
                 continue
 
-            distinct = sorted(set(deltas))
+            centers, delta_map = self._cluster_deltas(deltas)
+            clustered = [delta_map[d] for d in deltas]
 
-            if len(distinct) == 2:
+            label = (
+                f"flow {flow_key[0]}→{flow_key[1]}:{flow_key[2]}"
+                if flow_key != "all"
+                else "all packets"
+            )
+            if len(centers) == 2:
                 findings.extend(
-                    self._decode_binary_timing(
-                        path, iface_id, deltas, distinct, flag_pattern
-                    )
+                    self._decode_binary_timing(path, label, clustered, centers, flag_pattern)
                 )
-            elif len(distinct) in (3, 4):
+            elif len(centers) in (3, 4):
                 findings.extend(
-                    self._decode_basen_timing(
-                        path, iface_id, deltas, distinct, flag_pattern
-                    )
+                    self._decode_basen_timing(path, label, clustered, centers, flag_pattern)
                 )
 
         return findings
@@ -682,7 +883,7 @@ class PcapAnalyzer(Analyzer):
     def _decode_binary_timing(
         self,
         path: str,
-        iface_id: int,
+        source_label,
         deltas: List[float],
         distinct: List[float],
         flag_pattern: re.Pattern,
@@ -698,8 +899,8 @@ class PcapAnalyzer(Analyzer):
             ("framing+1",   [1] + bits),
         ]
 
-        for label, bit_seq in candidates:
-            # Pad to byte boundary
+        src = f"iface#{source_label}" if isinstance(source_label, int) else str(source_label)
+        for align_label, bit_seq in candidates:
             remainder = len(bit_seq) % 8
             padded = bit_seq + [0] * ((8 - remainder) % 8) if remainder else bit_seq
             for order, rev in (("MSB", False), ("LSB", True)):
@@ -708,9 +909,9 @@ class PcapAnalyzer(Analyzer):
                     fm = self._check_flag(decoded, flag_pattern)
                     findings.append(self._finding(
                         path,
-                        f"Covert timing channel decoded — iface#{iface_id} "
-                        f"({label}, {order}-first)",
-                        f"Short={short_val}s=0  Long={long_val}s=1\n"
+                        f"Covert timing channel decoded — {src} "
+                        f"({align_label}, {order}-first)",
+                        f"Short={short_val:.6f}s=0  Long={long_val:.6f}s=1\n"
                         f"{len(deltas)} deltas → {len(padded)//8} bytes\n"
                         f"Decoded: {decoded[:300]}",
                         severity="HIGH" if fm else "MEDIUM",
@@ -722,15 +923,15 @@ class PcapAnalyzer(Analyzer):
     def _decode_basen_timing(
         self,
         path: str,
-        iface_id: int,
+        source_label,
         deltas: List[float],
         distinct: List[float],
         flag_pattern: re.Pattern,
     ) -> List[Finding]:
         """Decode a 3–4 value timing channel as base-N symbols."""
         findings: List[Finding] = []
+        src = f"iface#{source_label}" if isinstance(source_label, int) else str(source_label)
         if len(distinct) == 4:
-            # 2 bits per symbol
             sym_map = {v: i for i, v in enumerate(distinct)}
             bits: List[int] = []
             for d in deltas:
@@ -743,7 +944,7 @@ class PcapAnalyzer(Analyzer):
                     fm = self._check_flag(decoded, flag_pattern)
                     findings.append(self._finding(
                         path,
-                        f"Covert timing channel (base-4) decoded — iface#{iface_id} ({order}-first)",
+                        f"Covert timing channel (base-4) decoded — {src} ({order}-first)",
                         f"Symbol map: {sym_map}\nDecoded: {decoded[:300]}",
                         severity="HIGH" if fm else "MEDIUM",
                         flag_match=fm,

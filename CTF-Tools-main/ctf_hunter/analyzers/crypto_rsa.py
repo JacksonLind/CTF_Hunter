@@ -382,7 +382,8 @@ class CryptoRSAAnalyzer(Analyzer):
         findings: List[Finding] = []
 
         try:
-            raw = open(path, "rb").read()
+            with open(path, "rb") as _fh:
+                raw = _fh.read()
         except Exception:
             return []
 
@@ -719,3 +720,523 @@ class CryptoRSAAnalyzer(Analyzer):
             if 2 <= val < n and abs(val.bit_length() - n_bits) <= n_bits // 5:
                 return val
         return None
+
+
+# ---------------------------------------------------------------------------
+# ECC: helper arithmetic + Smart attack + Pohlig-Hellman
+# ---------------------------------------------------------------------------
+
+# Regex to extract labelled ECC parameters from challenge text files.
+# Handles both decimal and 0x-prefixed hex.  Point coords may be bare
+# integers or (x, y) tuples.
+_ECC_PARAM_RE = re.compile(
+    r"(?:^|[\n\r\s])(?P<name>p|a|b|n|order|gx|gy|qx|qy)"
+    r"\s*[=:]\s*(?P<val>0x[0-9a-fA-F]+|[0-9]{4,})",
+    re.MULTILINE | re.IGNORECASE,
+)
+_ECC_TUPLE_RE = re.compile(
+    r"(?:^|[\n\r\s])(?P<name>G|Q|generator|public[_\s]?key)"
+    r"\s*[=:]\s*\(\s*(?P<x>0x[0-9a-fA-F]+|[0-9]{4,})\s*,\s*"
+    r"(?P<y>0x[0-9a-fA-F]+|[0-9]{4,})\s*\)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _parse_int(s: str) -> int:
+    s = s.strip()
+    return int(s, 16) if s.startswith("0x") or s.startswith("0X") else int(s)
+
+
+def _ec_add(P, Q, a: int, p: int):
+    """Affine point addition on y^2 = x^3 + ax + b (mod p).  None = infinity."""
+    if P is None:
+        return Q
+    if Q is None:
+        return P
+    x1, y1 = P
+    x2, y2 = Q
+    if x1 % p == x2 % p:
+        if (y1 + y2) % p == 0:
+            return None  # P + (-P) = infinity
+        # Point doubling
+        inv = pow(int(2 * y1) % p, -1, p)
+        lam = (3 * x1 * x1 + a) * inv % p
+    else:
+        inv = pow(int(x2 - x1) % p, -1, p)
+        lam = (y2 - y1) * inv % p
+    x3 = (lam * lam - x1 - x2) % p
+    y3 = (lam * (x1 - x3) - y1) % p
+    return (x3, y3)
+
+
+def _ec_mul(k: int, P, a: int, p: int):
+    """Scalar multiplication k*P on an elliptic curve over Fp."""
+    if P is None:
+        return None
+    if k < 0:
+        P = (P[0], (-P[1]) % p)
+        k = -k
+    result = None
+    addend = P
+    while k:
+        if k & 1:
+            result = _ec_add(result, addend, a, p)
+        addend = _ec_add(addend, addend, a, p)
+        k >>= 1
+    return result
+
+
+def _trial_factor(n: int, limit: int = 100_000) -> Optional[List[Tuple[int, int]]]:
+    """Trial-divide n up to *limit*.  Returns [(prime, exponent)] list if fully
+    factored within the limit, else None."""
+    factors: List[Tuple[int, int]] = []
+    d = 2
+    while d * d <= n and d <= limit:
+        if n % d == 0:
+            exp = 0
+            while n % d == 0:
+                exp += 1
+                n //= d
+            factors.append((d, exp))
+        d += 1 if d == 2 else 2
+    if n > 1:
+        if n > limit:
+            return None  # not fully factored within limit
+        factors.append((n, 1))
+    return factors if factors else [(n, 1)]
+
+
+def _bsgs_ec(G, Q, q: int, e: int, a: int, p: int) -> Optional[int]:
+    """Baby-step giant-step DLP in the order-q^e subgroup of E(Fp).
+    Solves Q = k*G for k in [0, q^e)."""
+    if G is None:
+        return 0 if Q is None else None
+    if Q is None:
+        return 0
+    mod = q ** e
+    m = int(math.isqrt(mod)) + 1
+    # Baby steps: store {j*G: j} for j in 0..m-1
+    baby: dict = {}
+    step = None
+    for j in range(m):
+        key = step
+        baby[key] = j
+        step = _ec_add(step, G, a, p)
+    # Giant steps: Q - i*(m*G)
+    mG = _ec_mul(m, G, a, p)
+    neg_mG = (mG[0], (-mG[1]) % p) if mG else None
+    giant = Q
+    for i in range(m):
+        if giant in baby:
+            k = (i * m + baby[giant]) % mod
+            return k
+        giant = _ec_add(giant, neg_mG, a, p)
+    return None
+
+
+def _crt(residues: List[int], moduli: List[int]) -> int:
+    """Chinese Remainder Theorem: given r[i] ≡ x (mod m[i]), return x."""
+    M = 1
+    for mi in moduli:
+        M *= mi
+    x = 0
+    for ri, mi in zip(residues, moduli):
+        Mi = M // mi
+        x += ri * Mi * pow(Mi, -1, mi)
+    return x % M
+
+
+def _smart_attack(p: int, a: int, Gx: int, Gy: int, Qx: int, Qy: int) -> Optional[int]:
+    """Smart's attack for anomalous elliptic curves (#E(Fp) == p).
+
+    Computes the DLP via the formal group logarithm using p-adic arithmetic.
+    Points in E^1(Qp) (formal group) have x with v_p = -2 and y with v_p = -3,
+    so the formal group parameter t = -x/y has v_p = 1 and
+
+        log_G = t([p]*G_lift) / p  ≡  -(x_unit) / (y_unit)  mod p
+
+    where x_unit = (x * p²) mod p  and  y_unit = (y * p³) mod p.
+
+    Returns k such that Q = k*G (with k in [0, p-1]), or None on failure.
+    """
+    # ------------------------------------------------------------------
+    # Minimal p-adic arithmetic with precision PREC digits.
+    # A value is stored as (v, c) where value = p^v * c  (c not div by p).
+    # ------------------------------------------------------------------
+    PREC = max(8, p.bit_length() // 8 + 4)  # digits of p-adic precision
+    PK = p ** PREC
+
+    def _strip(n: int) -> tuple:
+        """Return (v, c) with n = p^v * c,  c not divisible by p."""
+        if n == 0:
+            return PREC, 0
+        v = 0
+        while n % p == 0:
+            n //= p
+            v += 1
+        return v, n % PK
+
+    class _Pad:
+        """Minimal p-adic number: value = p^v * c."""
+        __slots__ = ("v", "c")
+
+        def __init__(self, n: int = 0, d: int = 1) -> None:
+            if n == 0:
+                self.v, self.c = PREC, 0
+                return
+            vn, ns = _strip(abs(n))
+            vd, ds = _strip(abs(d))
+            self.v = vn - vd
+            sign = -1 if (n < 0) != (d < 0) else 1
+            try:
+                self.c = sign * ns * pow(int(ds), -1, PK) % PK
+            except Exception:
+                self.v, self.c = PREC, 0
+
+        @staticmethod
+        def _new(v: int, c: int) -> "_Pad":
+            r = _Pad.__new__(_Pad)
+            r.v, r.c = v, c % PK
+            return r
+
+        def __add__(self, o: "_Pad") -> "_Pad":
+            if self.v >= PREC:
+                return o
+            if o.v >= PREC:
+                return self
+            if self.v <= o.v:
+                c = (self.c + o.c * p ** (o.v - self.v)) % PK
+                r = _Pad._new(self.v, c)
+            else:
+                c = (self.c * p ** (self.v - o.v) + o.c) % PK
+                r = _Pad._new(o.v, c)
+            if r.c == 0:
+                r.v = PREC
+                return r
+            while r.c % p == 0:
+                r.c //= p
+                r.v += 1
+            return r
+
+        def __neg__(self) -> "_Pad":
+            return _Pad._new(self.v, (-self.c) % PK)
+
+        def __sub__(self, o: "_Pad") -> "_Pad":
+            return self + (-o)
+
+        def __mul__(self, o: "_Pad") -> "_Pad":
+            if self.v >= PREC or o.v >= PREC:
+                return _Pad()
+            r = _Pad._new(self.v + o.v, self.c * o.c % PK)
+            if r.c == 0:
+                r.v = PREC
+                return r
+            while r.c % p == 0:
+                r.c //= p
+                r.v += 1
+            return r
+
+        def __truediv__(self, o: "_Pad") -> "_Pad":
+            if o.v >= PREC:
+                raise ZeroDivisionError("p-adic zero")
+            inv_c = pow(int(o.c % PK), -1, PK)
+            return _Pad._new(self.v - o.v, self.c * inv_c % PK)
+
+        def unit_mod_p(self) -> int:
+            """Return c mod p (the leading p-adic digit, ignoring valuation)."""
+            return int(self.c % p)
+
+    def _pad(n: int) -> _Pad:
+        return _Pad(n)
+
+    # ------------------------------------------------------------------
+    # Hensel-lift y from E(Fp) to E(Z/p²Z)
+    # ------------------------------------------------------------------
+    b = (Gy * Gy - pow(Gx, 3) - a * Gx) % p
+    p2 = p * p
+
+    def _hensel_y(x: int, y0: int, b_lift: int = b) -> Optional[int]:
+        """Hensel-lift y0 from E(Fp) to E'(Z/p²Z) where E' uses b_lift."""
+        rhs = (pow(x, 3, p2) + a * x + b_lift) % p2
+        f_val = (y0 * y0 - rhs) % p2
+        if f_val % p != 0:
+            return None
+        inv_2y = pow(2 * y0 % p, -1, p)
+        t = (f_val // p) * inv_2y % p
+        return (y0 - t * p) % p2
+
+    # ------------------------------------------------------------------
+    # Elliptic curve addition over Q_p using p-adic arithmetic
+    # ------------------------------------------------------------------
+    def _ec_add_pad(P, Q):
+        if P is None:
+            return Q
+        if Q is None:
+            return P
+        x1, y1 = P
+        x2, y2 = Q
+        dx = x2 - x1
+        if dx.v >= PREC:                    # x1 == x2
+            dy_sum = y1 + y2
+            if dy_sum.v >= PREC:
+                return None                 # inverses → infinity
+            lam = (_pad(3) * x1 * x1 + _pad(a)) / (_pad(2) * y1)
+        else:
+            lam = (y2 - y1) / dx
+        x3 = lam * lam - x1 - x2
+        y3 = lam * (x1 - x3) - y1
+        return (x3, y3)
+
+    def _ec_mul_pad(k: int, Px: int, Py: int):
+        result = None
+        addend = (_pad(Px), _pad(Py))
+        while k:
+            if k & 1:
+                result = _ec_add_pad(result, addend)
+            addend = _ec_add_pad(addend, addend)
+            k >>= 1
+        return result
+
+    # ------------------------------------------------------------------
+    # Formal group logarithm
+    # For P = [p]*G_lift ∈ E^1(Qp):
+    #   v_p(x(P)) = -2,  v_p(y(P)) = -3
+    #   t(P) = -x/y  →  v_p(t) = 1
+    #   log(P) = t(P)/p  ≡  -(x.c mod p) * inv(y.c mod p)  mod p
+    # ------------------------------------------------------------------
+    def _formal_log(pt) -> Optional[int]:
+        """Return the p-adic formal group log of a point in E^1 as an integer mod p."""
+        if pt is None:
+            return None
+        xP, yP = pt
+        if xP.v != -2 or yP.v != -3:
+            return None  # not in the expected E^1 stratum
+        x_unit = xP.unit_mod_p()
+        y_unit = yP.unit_mod_p()
+        if y_unit == 0:
+            return None
+        try:
+            return (-x_unit * pow(y_unit, -1, p)) % p
+        except Exception:
+            return None
+
+    # Try successive curve lifts b' = b + t*p until the formal group log
+    # of [p]*G_lift lands in E^1 \ E^2 (i.e. log_G ≢ 0 mod p).
+    # This handles the rare case where the standard lift gives [p]*G_lift ∈ E^2.
+    for t_lift in range(p):
+        try:
+            b_lift = (b + t_lift * p) % p2
+            Gy_lift = _hensel_y(Gx, Gy, b_lift)
+            Qy_lift = _hensel_y(Qx, Qy, b_lift)
+            if Gy_lift is None or Qy_lift is None:
+                continue
+
+            pG = _ec_mul_pad(p, Gx, Gy_lift)
+            pQ = _ec_mul_pad(p, Qx, Qy_lift)
+
+            log_G = _formal_log(pG)
+            if log_G is None or log_G == 0:
+                continue          # try next lift
+
+            log_Q = _formal_log(pQ)
+            if log_Q is None:
+                continue
+
+            return log_Q * pow(int(log_G), -1, p) % p
+        except Exception:
+            continue
+
+    return None
+
+
+def _pohlig_hellman_ec(
+    p: int, a: int, G, n: int, Q, factor_limit: int = 100_000
+) -> Optional[int]:
+    """Pohlig-Hellman DLP on E(Fp): solve Q = k*G given smooth group order n.
+
+    Returns k or None if the order is not sufficiently smooth.
+    """
+    factors = _trial_factor(n, factor_limit)
+    if not factors:
+        return None
+
+    residues: List[int] = []
+    moduli: List[int] = []
+
+    for q, e in factors:
+        mod = q ** e
+        cofactor = n // mod
+        Gq = _ec_mul(cofactor, G, a, p)
+        Qq = _ec_mul(cofactor, Q, a, p)
+        if Gq is None:
+            if Qq is None:
+                residues.append(0)
+                moduli.append(mod)
+                continue
+            return None
+        k_q = _bsgs_ec(Gq, Qq, q, e, a, p)
+        if k_q is None:
+            return None
+        residues.append(k_q)
+        moduli.append(mod)
+
+    try:
+        k = _crt(residues, moduli) % n
+    except Exception:
+        return None
+    return k
+
+
+def _extract_ecc_params(text: str) -> dict:
+    """Parse ECC parameters from a challenge text file.
+
+    Returns a dict with any of: p, a, b, n, Gx, Gy, Qx, Qy.
+    """
+    params: dict = {}
+    for m in _ECC_PARAM_RE.finditer(text):
+        name = m.group("name").lower()
+        val  = _parse_int(m.group("val"))
+        # Normalise aliases
+        if name == "order":
+            name = "n"
+        params[name] = val
+
+    for m in _ECC_TUPLE_RE.finditer(text):
+        name = m.group("name").lower().replace(" ", "").replace("_", "")
+        x = _parse_int(m.group("x"))
+        y = _parse_int(m.group("y"))
+        if "g" in name or "gen" in name:
+            params["gx"] = x
+            params["gy"] = y
+        elif "q" in name or "pub" in name:
+            params["qx"] = x
+            params["qy"] = y
+
+    return params
+
+
+class CryptoECCAnalyzer(Analyzer):
+    """ECC attack suite: anomalous curve (Smart attack) + Pohlig-Hellman."""
+
+    def analyze(
+        self,
+        path: str,
+        flag_pattern: re.Pattern,
+        depth: str,
+        ai_client: Optional[AIClient],
+        **_kw,
+    ) -> List[Finding]:
+        findings: List[Finding] = []
+        try:
+            with open(path, "rb") as _fh:
+                raw = _fh.read()
+        except Exception:
+            return []
+
+        text = raw.decode("utf-8", errors="replace")
+        params = _extract_ecc_params(text)
+
+        p  = params.get("p")
+        a  = params.get("a")
+        b  = params.get("b")
+        n  = params.get("n")
+        Gx = params.get("gx")
+        Gy = params.get("gy")
+        Qx = params.get("qx")
+        Qy = params.get("qy")
+
+        if not p or not a:
+            return []
+
+        # Need at minimum p, a, and n to do anything useful
+        if not n:
+            return []
+
+        findings.append(self._finding(
+            path,
+            f"ECC parameters detected (p={p.bit_length()}-bit)",
+            f"p  = {hex(p)}\na  = {a}\nb  = {b}\nn  = {n}\n"
+            f"Anomalous: {'YES (#E = p)' if n == p else 'no'}",
+            severity="MEDIUM",
+            confidence=0.70,
+        ))
+
+        # ------------------------------------------------------------------
+        # Anomalous curve: Smart attack
+        # ------------------------------------------------------------------
+        if n == p:
+            findings.append(self._finding(
+                path,
+                "Anomalous ECC curve detected (#E = p) — Smart attack applicable",
+                "The curve order equals the characteristic p.  "
+                "The discrete log problem reduces to a p-adic computation (O(log p)).",
+                severity="HIGH",
+                confidence=0.90,
+            ))
+
+            if Gx is not None and Gy is not None and Qx is not None and Qy is not None:
+                try:
+                    k = _smart_attack(p, a, Gx, Gy, Qx, Qy)
+                except Exception:
+                    k = None
+
+                if k is not None:
+                    # Attempt to interpret k as a flag
+                    plaintext = _try_decode_plaintext(k)
+                    fm = self._check_flag(plaintext, flag_pattern)
+                    findings.append(self._finding(
+                        path,
+                        "Smart attack: discrete log recovered",
+                        f"k = {k}\nDecoded: {plaintext[:300]}",
+                        severity="HIGH" if fm else "MEDIUM",
+                        flag_match=fm,
+                        confidence=0.95 if fm else 0.82,
+                    ))
+                else:
+                    findings.append(self._finding(
+                        path,
+                        "Smart attack: failed (verify G, Q coordinates and curve params)",
+                        "Could not compute discrete log — check that G and Q "
+                        "are correct points on the curve and #E = p.",
+                        severity="MEDIUM",
+                        confidence=0.55,
+                    ))
+
+        # ------------------------------------------------------------------
+        # Smooth-order curve: Pohlig-Hellman
+        # ------------------------------------------------------------------
+        elif _trial_factor(n, 100_000) is not None:
+            factors = _trial_factor(n, 100_000)
+            factor_str = " × ".join(
+                f"{q}^{e}" if e > 1 else str(q) for q, e in factors
+            )
+            findings.append(self._finding(
+                path,
+                f"ECC group order is smooth — Pohlig-Hellman applicable",
+                f"n = {n}\nFactors: {factor_str}",
+                severity="HIGH",
+                confidence=0.85,
+            ))
+
+            if (Gx is not None and Gy is not None
+                    and Qx is not None and Qy is not None):
+                G = (Gx, Gy)
+                Q = (Qx, Qy)
+                try:
+                    k = _pohlig_hellman_ec(p, a, G, n, Q)
+                except Exception:
+                    k = None
+
+                if k is not None:
+                    plaintext = _try_decode_plaintext(k)
+                    fm = self._check_flag(plaintext, flag_pattern)
+                    findings.append(self._finding(
+                        path,
+                        "Pohlig-Hellman: discrete log recovered",
+                        f"k = {k}\nDecoded: {plaintext[:300]}",
+                        severity="HIGH" if fm else "MEDIUM",
+                        flag_match=fm,
+                        confidence=0.92 if fm else 0.78,
+                    ))
+
+        return findings

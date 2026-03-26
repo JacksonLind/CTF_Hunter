@@ -47,6 +47,7 @@ from ui.transform_pipeline import make_transform_pipeline_dock, TransformPipelin
 from ui.attack_plan_tab import AttackPlanTab
 from ui.attack_chains_tab import AttackChainsTab
 from ui.help_tab import HelpTab
+from ui.investigate_tab import InvestigateTab
 
 # ---------------------------------------------------------------------------
 # Worker signals / runnable
@@ -359,7 +360,12 @@ class MainWindow(QMainWindow):
         self._timeline_tab = TimelineTab()
         tabs.addTab(self._timeline_tab, "🕒 Timeline")
 
-        # --- Tab 9: Help ---
+        # --- Tab 10: Investigate ---
+        self._investigate_tab = InvestigateTab()
+        self._investigate_tab.pin_finding_requested.connect(self._on_pin_finding)
+        tabs.addTab(self._investigate_tab, "🧭 Investigate")
+
+        # --- Tab 11: Help ---
         self._help_tab = HelpTab()
         tabs.addTab(self._help_tab, "❓ Help")
 
@@ -499,6 +505,7 @@ class MainWindow(QMainWindow):
         self._hex_viewer.load_file(path)
         self._notes_edit.setPlainText(self._notes_by_file.get(path, ""))
         self._file_intel.load_file(path)
+        self._investigate_tab.load_file(path)
 
     def _on_notes_changed(self) -> None:
         item = self._file_list.currentItem()
@@ -535,6 +542,8 @@ class MainWindow(QMainWindow):
 
         depth = self._depth_combo.currentText().lower()
         self._session.depth = depth
+        self._investigate_tab.set_flag_pattern(flag_pattern)
+        self._investigate_tab.set_depth(depth)
 
         worker = _AnalyzeWorker(path, flag_pattern, depth, self._ai_client)
         worker.signals.finished.connect(self._on_analysis_done)

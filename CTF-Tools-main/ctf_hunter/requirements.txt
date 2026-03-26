@@ -16,6 +16,12 @@ bcrypt>=4.0.0
 scipy>=1.11.0
 imageio-ffmpeg>=0.4.9
 pytesseract>=0.3.10
+# Optional: QR code repair and decode pipeline. Remove the leading '#' to install.
+# opencv-python-headless>=4.8.0
+# pyzbar>=0.1.9         # alternative QR decoder (requires libzbar system library)
 # Optional: dynamic Frida instrumentation (Task 4). Remove the leading '#' to install.
 # frida>=16.0.0
 # frida-tools>=12.0.0
+# Optional: 7z and RAR archive password cracking. Remove the leading '#' to install.
+# py7zr>=0.20.0         # pure-Python 7z read/write
+# rarfile>=4.1          # RAR read (also requires unrar binary: apt install unrar)

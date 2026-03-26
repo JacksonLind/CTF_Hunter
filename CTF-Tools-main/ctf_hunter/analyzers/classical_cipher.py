@@ -16,6 +16,23 @@ import string
 from collections import Counter
 from typing import List, Optional, Tuple
 
+# ---------------------------------------------------------------------------
+# Rotation / Affine / Grey-code constants
+# ---------------------------------------------------------------------------
+
+# Base64 and URL-safe Base64 alphabets — common CTF custom-encoding targets
+_B64_STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+_B64_URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+# Valid multipliers for affine cipher mod 26 (gcd(a, 26) == 1)
+_AFFINE_VALID_A = [1, 3, 5, 7, 9, 11, 15, 17, 19, 21, 23, 25]
+
+# Common keywords used in CTF keyword-substitution ciphers
+_CTF_KEYWORDS = [
+    "secret", "flag", "cipher", "crypto", "key", "ctf", "password",
+    "hack", "pwn", "alpha", "zero", "one", "ghost", "shadow",
+]
+
 from core.report import Finding
 from core.ai_client import AIClient
 from core.external import run_strings
@@ -86,6 +103,58 @@ def _score_bigrams(text: str) -> float:
         return 0.0
     score = sum(_ENG_BIGRAMS.get(alpha[i:i + 2], 0.0) for i in range(total))
     return score / total
+
+
+def _rotate(alphabet: str, n: int) -> str:
+    """Cyclic rotation of *alphabet* by *n* positions."""
+    n = n % len(alphabet)
+    return alphabet[n:] + alphabet[:n]
+
+
+def _mod_inverse(a: int, m: int) -> int:
+    """Modular multiplicative inverse of *a* mod *m* (brute-force; m≤26)."""
+    a = a % m
+    for x in range(1, m):
+        if (a * x) % m == 1:
+            return x
+    return 1  # gcd(a,m) != 1 — caller must ensure valid a
+
+
+def _affine_decrypt(text: str, a: int, b: int) -> str:
+    """Decrypt affine cipher: E(x) = (a·x + b) mod 26 → x = a⁻¹·(y−b) mod 26."""
+    a_inv = _mod_inverse(a, 26)
+    result = []
+    for c in text:
+        if c.isalpha():
+            y = ord(c.lower()) - ord('a')
+            x = (a_inv * (y - b)) % 26
+            result.append(chr(x + (ord('a') if c.islower() else ord('A'))))
+        else:
+            result.append(c)
+    return ''.join(result)
+
+
+def _keyword_alpha(keyword: str) -> str:
+    """Build keyword-substitution alphabet: deduplicated keyword letters + rest."""
+    seen: set[str] = set()
+    alpha: list[str] = []
+    for c in keyword.lower():
+        if c.isalpha() and c not in seen:
+            seen.add(c)
+            alpha.append(c)
+    for c in string.ascii_lowercase:
+        if c not in seen:
+            alpha.append(c)
+    return ''.join(alpha)
+
+
+def _grey_decode(grey: int) -> int:
+    """Convert reflected-binary (Grey) code to standard binary integer."""
+    mask = grey >> 1
+    while mask:
+        grey ^= mask
+        mask >>= 1
+    return grey
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +542,15 @@ class ClassicalCipherAnalyzer(Analyzer):
                     severity="MEDIUM", confidence=0.50,
                 ))
 
+        # --- Custom alphabet rotation brute-force ---
+        findings.extend(self._check_rotation_brute(path, text, flag_pattern))
+
+        # --- Affine cipher + keyword substitution ---
+        findings.extend(self._check_affine(path, text, flag_pattern))
+
+        # --- Grey code decoding ---
+        findings.extend(self._check_grey_rotation(path, text, flag_pattern))
+
         # --- IC anomaly fallback ---
         if not findings and (ic < 0.040 or ic > 0.070):
             findings.append(self._finding(
@@ -515,3 +593,221 @@ class ClassicalCipherAnalyzer(Analyzer):
                 best_dec = dec
 
         return ''.join(best_key), best_dec
+
+    # ------------------------------------------------------------------
+    # Rotation / Affine / Grey-code methods
+    # ------------------------------------------------------------------
+
+    def _check_rotation_brute(
+        self, path: str, text: str, flag_pattern: re.Pattern
+    ) -> List[Finding]:
+        """Try all cyclic rotations of non-standard alphabets as substitution keys.
+
+        If the ciphertext chars come predominantly from a known custom alphabet
+        (Base64-std, Base64-url), brute-force all N rotations and score each
+        candidate plaintext by English letter frequency.
+        """
+        findings: List[Finding] = []
+
+        candidate_alphabets = [
+            ("Base64-std rotation", _B64_STD),
+            ("Base64-url rotation", _B64_URL),
+        ]
+
+        for alph_label, alphabet in candidate_alphabets:
+            n = len(alphabet)
+            alph_set = set(alphabet)
+            printable = [c for c in text if not c.isspace()]
+            if not printable:
+                continue
+            coverage = sum(1 for c in printable if c in alph_set) / len(printable)
+            if coverage < 0.75:
+                continue
+
+            best_score = 0.0
+            best_rot = 0
+            best_dec = ""
+
+            for rot in range(1, n):
+                rotated = _rotate(alphabet, rot)
+                table = str.maketrans(rotated, alphabet)
+                decrypted = text.translate(table)
+
+                if self._check_flag(decrypted, flag_pattern):
+                    findings.append(self._finding(
+                        path,
+                        f"{alph_label} (rot={rot}) — flag pattern match",
+                        f"Rotation: {rot}\nPlaintext: {decrypted[:200]}",
+                        severity="HIGH", flag_match=True, confidence=0.90,
+                    ))
+                    break
+
+                score = _score_english_freq(decrypted)
+                if score > best_score:
+                    best_score = score
+                    best_rot = rot
+                    best_dec = decrypted
+            else:
+                if best_dec and best_score > _ENGLISH_FREQ_THRESHOLD:
+                    findings.append(self._finding(
+                        path,
+                        f"Possible {alph_label} (rot={best_rot})",
+                        f"Rotation: {best_rot} | Score: {best_score:.3f}\n"
+                        f"Plaintext: {best_dec[:200]}",
+                        severity="MEDIUM",
+                        confidence=min(best_score, 0.70),
+                    ))
+
+        return findings
+
+    def _check_affine(
+        self, path: str, text: str, flag_pattern: re.Pattern
+    ) -> List[Finding]:
+        """Try all valid affine cipher keys (12 × 26 = 312) plus common keyword
+        substitution alphabets."""
+        findings: List[Finding] = []
+        best_score = 0.0
+        best_label = ""
+        best_dec = ""
+
+        # Affine: E(x) = (a*x + b) mod 26
+        for a in _AFFINE_VALID_A:
+            for b in range(26):
+                if a == 1 and b in (0, 13):
+                    continue  # identity and ROT13 already checked
+                decrypted = _affine_decrypt(text, a, b)
+                if self._check_flag(decrypted, flag_pattern):
+                    findings.append(self._finding(
+                        path,
+                        f"Affine cipher (a={a}, b={b}) — flag pattern match",
+                        f"Key: a={a}, b={b}\nPlaintext: {decrypted[:200]}",
+                        severity="HIGH", flag_match=True, confidence=0.92,
+                    ))
+                    return findings
+                score = _score_english_freq(decrypted)
+                if score > best_score:
+                    best_score = score
+                    best_label = f"a={a}, b={b}"
+                    best_dec = decrypted
+
+        # Keyword substitution alphabets
+        for kw in _CTF_KEYWORDS:
+            sub_alpha = _keyword_alpha(kw)
+            trans = str.maketrans(sub_alpha, string.ascii_lowercase)
+            lower_dec = text.lower().translate(trans)
+            decrypted = ''.join(
+                c.upper() if text[i].isupper() else c
+                for i, c in enumerate(lower_dec)
+            )
+            if self._check_flag(decrypted, flag_pattern):
+                findings.append(self._finding(
+                    path,
+                    f"Keyword substitution (keyword='{kw}') — flag pattern match",
+                    f"Keyword: {kw}\nPlaintext: {decrypted[:200]}",
+                    severity="HIGH", flag_match=True, confidence=0.85,
+                ))
+                return findings
+            score = _score_english_freq(decrypted)
+            if score > best_score:
+                best_score = score
+                best_label = f"keyword='{kw}'"
+                best_dec = decrypted
+
+        if best_dec and best_score > _ENGLISH_FREQ_THRESHOLD:
+            findings.append(self._finding(
+                path,
+                f"Possible affine/keyword substitution ({best_label})",
+                f"Key: {best_label} | Score: {best_score:.3f}\n"
+                f"Plaintext: {best_dec[:200]}",
+                severity="MEDIUM",
+                confidence=min(best_score, 0.65),
+            ))
+
+        return findings
+
+    def _check_grey_rotation(
+        self, path: str, text: str, flag_pattern: re.Pattern
+    ) -> List[Finding]:
+        """Interpret alphabetic positions as 5-bit Grey code values and decode.
+
+        Motivated by EHAX #808080 (Grey code rotation wheels): each cipher
+        character's 0-based position in the alphabet is treated as a Grey code
+        value; decoding gives the plaintext position.  Also tries all 26 Caesar
+        shifts on the Grey-decoded text in case a rotation was applied on top.
+        """
+        findings: List[Finding] = []
+        alpha_text = ''.join(c.lower() for c in text if c.isalpha())
+        if len(alpha_text) < 6:
+            return []
+
+        # Grey-decode every alpha char while preserving punctuation / braces
+        grey_chars: list[str] = []
+        for c in text:
+            if c.isalpha():
+                pos = ord(c.lower()) - ord('a')
+                decoded = _grey_decode(pos) % 26
+                ch = chr(decoded + ord('a'))
+                grey_chars.append(ch.upper() if c.isupper() else ch)
+            else:
+                grey_chars.append(c)
+        grey_decoded = ''.join(grey_chars)
+
+        if self._check_flag(grey_decoded, flag_pattern):
+            findings.append(self._finding(
+                path,
+                "Grey code alphabet decoding — flag pattern match",
+                f"Decoded: {grey_decoded[:200]}",
+                severity="HIGH", flag_match=True, confidence=0.88,
+            ))
+            return findings
+
+        base_score = _score_english_freq(grey_decoded)
+        if base_score > _ENGLISH_FREQ_THRESHOLD:
+            findings.append(self._finding(
+                path,
+                "Possible Grey code alphabet encoding",
+                f"Score: {base_score:.3f}\nDecoded: {grey_decoded[:200]}",
+                severity="MEDIUM", confidence=min(base_score, 0.60),
+            ))
+            # Fall through — also try pre-rotation variants in case a shift was applied
+
+        # Try all 26 rotations applied BEFORE Grey-decoding.
+        # Correct inverse of: cipher = (grey_encode(plain) + rot) % 26
+        #   → plain = grey_decode((cipher - rot) % 26)
+        best_score = 0.0
+        best_rot = 0
+        best_dec = ""
+        for rot in range(1, 26):
+            pre_shifted: list[str] = []
+            for c in text:
+                if c.isalpha():
+                    cp = ord(c.lower()) - ord('a')
+                    pp = _grey_decode((cp - rot) % 26) % 26
+                    ch = chr(pp + ord('a'))
+                    pre_shifted.append(ch.upper() if c.isupper() else ch)
+                else:
+                    pre_shifted.append(c)
+            rotated = ''.join(pre_shifted)
+            if self._check_flag(rotated, flag_pattern):
+                findings.append(self._finding(
+                    path,
+                    f"Grey code + rotation (rot={rot}) — flag pattern match",
+                    f"Rotation: {rot}\nDecoded: {rotated[:200]}",
+                    severity="HIGH", flag_match=True, confidence=0.85,
+                ))
+                return findings
+            score = _score_english_freq(rotated)
+            if score > best_score:
+                best_score = score
+                best_rot = rot
+                best_dec = rotated
+
+        if best_dec and best_score > _ENGLISH_FREQ_THRESHOLD:
+            findings.append(self._finding(
+                path,
+                f"Possible Grey code + Caesar (rot={best_rot})",
+                f"Score: {best_score:.3f}\nDecoded: {best_dec[:200]}",
+                severity="MEDIUM", confidence=min(best_score, 0.55),
+            ))
+
+        return findings

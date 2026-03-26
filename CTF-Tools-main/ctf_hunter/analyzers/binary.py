@@ -93,6 +93,9 @@ _MAX_SECTIONS_PARSED = 64
 # CodeView debug info header: 4-byte signature + 16-byte GUID + 4-byte age
 _CODEVIEW_HEADER_SIZE = 24
 
+# PE resource type constant for raw binary data blobs
+_RT_RCDATA = 10
+
 
 # ---------------------------------------------------------------------------
 # Module-level helper functions
@@ -211,6 +214,10 @@ class BinaryAnalyzer(Analyzer):
                 findings.extend(self._decode_debug_strings(
                     path, fmt, debug_strs, flag_pattern, seen,
                 ))
+
+        # PE RCDATA resource extraction for re-dispatch (deep mode only)
+        if fmt == "PE" and depth != "fast":
+            findings.extend(self._extract_pe_rcdata(path, data, flag_pattern))
 
         # Overlay data (PE specific, kept from original)
         findings.extend(self._check_overlay(path, data, flag_pattern))
@@ -1221,4 +1228,141 @@ class BinaryAnalyzer(Analyzer):
                 confidence=0.1,
             ))
 
+        return findings
+
+    # ------------------------------------------------------------------
+    # PE RCDATA resource extraction
+    # ------------------------------------------------------------------
+
+    def _extract_pe_rcdata(
+        self,
+        path: str,
+        data: bytes,
+        flag_pattern: re.Pattern,
+    ) -> List[Finding]:
+        """Parse the PE .rsrc section and emit RCDATA (type 10) blobs for re-dispatch.
+
+        Each RCDATA leaf is emitted as a Finding whose detail contains a
+        ``raw_hex=<hex>`` token so that ``extract_from_finding`` (and the
+        ContentRedispatcher) can automatically re-analyze the blob through
+        the full analyzer pipeline.
+
+        Only blobs >= 4 bytes are emitted to avoid noise from tiny padding entries.
+        A guard of 256 entries per directory level prevents infinite loops on
+        malformed or hand-crafted PE resources.
+        """
+        findings: List[Finding] = []
+        if len(data) < 64 or data[:2] != b"MZ":
+            return findings
+        try:
+            pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+            if pe_off + 28 > len(data) or data[pe_off:pe_off + 4] != b"PE\x00\x00":
+                return findings
+
+            num_sections = struct.unpack_from("<H", data, pe_off + 6)[0]
+            opt_hdr_size = struct.unpack_from("<H", data, pe_off + 20)[0]
+            opt_off = pe_off + 24
+            if opt_off + 2 > len(data):
+                return findings
+            opt_magic = struct.unpack_from("<H", data, opt_off)[0]
+
+            # DataDirectory[2] = Resource directory RVA and size
+            # PE32  (0x10B): opt + 96 + 2×8 = opt + 112
+            # PE32+ (0x20B): opt + 112 + 2×8 = opt + 128
+            if opt_magic == 0x10B:
+                rsrc_dd_off = opt_off + 112
+            elif opt_magic == 0x20B:
+                rsrc_dd_off = opt_off + 128
+            else:
+                return findings
+
+            if rsrc_dd_off + 8 > len(data):
+                return findings
+            rsrc_rva = struct.unpack_from("<I", data, rsrc_dd_off)[0]
+            rsrc_sz = struct.unpack_from("<I", data, rsrc_dd_off + 4)[0]
+            if rsrc_rva == 0 or rsrc_sz == 0:
+                return findings
+
+            # Build section VA → file offset table
+            sec_tab_off = pe_off + 24 + opt_hdr_size
+            sections_raw: List[Tuple[int, int, int]] = []
+            for i in range(min(num_sections, _MAX_SECTIONS_PARSED)):
+                off = sec_tab_off + i * 40
+                if off + 40 > len(data):
+                    break
+                va = struct.unpack_from("<I", data, off + 12)[0]
+                raw_sz = struct.unpack_from("<I", data, off + 16)[0]
+                raw_off = struct.unpack_from("<I", data, off + 20)[0]
+                if raw_sz > 0 and raw_off > 0:
+                    sections_raw.append((va, raw_off, raw_sz))
+
+            rsrc_base = _rva_to_file_offset(rsrc_rva, sections_raw)
+            if rsrc_base < 0:
+                return findings
+
+            _MAX_DIR_ENTRIES = 256  # guard against malformed directories
+
+            def _parse_dir(
+                dir_file_off: int,
+                level: int,
+                res_type: int,
+                res_id: int,
+            ) -> None:
+                if dir_file_off + 16 > len(data):
+                    return
+                named_n = struct.unpack_from("<H", data, dir_file_off + 12)[0]
+                id_n = struct.unpack_from("<H", data, dir_file_off + 14)[0]
+                entries_off = dir_file_off + 16
+                for _ in range(min(named_n + id_n, _MAX_DIR_ENTRIES)):
+                    if entries_off + 8 > len(data):
+                        break
+                    name_id_field = struct.unpack_from("<I", data, entries_off)[0]
+                    offset_field = struct.unpack_from("<I", data, entries_off + 4)[0]
+                    entries_off += 8
+
+                    cur_type = res_type
+                    cur_id = res_id
+                    if level == 1:
+                        cur_type = name_id_field & 0x7FFFFFFF
+                        if cur_type != _RT_RCDATA:
+                            continue  # skip non-RCDATA type entries
+                    elif level == 2:
+                        cur_id = name_id_field & 0x7FFFFFFF
+
+                    if offset_field & 0x80000000:
+                        # Points to a subdirectory
+                        sub_off = rsrc_base + (offset_field & 0x7FFFFFFF)
+                        _parse_dir(sub_off, level + 1, cur_type, cur_id)
+                    else:
+                        # Leaf: IMAGE_RESOURCE_DATA_ENTRY (16 bytes)
+                        leaf_off = rsrc_base + offset_field
+                        if leaf_off + 16 > len(data):
+                            continue
+                        data_rva = struct.unpack_from("<I", data, leaf_off)[0]
+                        data_size = struct.unpack_from("<I", data, leaf_off + 4)[0]
+                        if data_rva == 0 or data_size == 0 or data_size > 0x1000000:
+                            continue
+                        file_off = _rva_to_file_offset(data_rva, sections_raw)
+                        if file_off < 0 or file_off + data_size > len(data):
+                            continue
+                        blob = data[file_off:file_off + data_size]
+                        if len(blob) < 4:
+                            continue
+                        text = blob.decode("latin-1", errors="replace")
+                        fm = self._check_flag(text, flag_pattern)
+                        findings.append(self._finding(
+                            path,
+                            f"PE RCDATA resource #{cur_id} ({data_size} bytes)",
+                            f"ResourceID={cur_id}, FileOffset=0x{file_off:x}, "
+                            f"Size={data_size}, raw_hex={blob.hex()}",
+                            severity="HIGH" if fm else "MEDIUM",
+                            offset=file_off,
+                            flag_match=fm,
+                            confidence=0.85 if fm else 0.60,
+                        ))
+
+            _parse_dir(rsrc_base, 1, 0, 0)
+
+        except Exception:
+            pass
         return findings

@@ -34,6 +34,10 @@ from analyzers.forensics_timeline import ForensicsTimelineAnalyzer
 from analyzers.image_format import ImageFormatAnalyzer
 from analyzers.crypto_rsa import CryptoRSAAnalyzer
 from analyzers.sal import SalAnalyzer
+from analyzers.crypto_prng import CryptoPRNGAnalyzer
+from analyzers.side_channel import SideChannelAnalyzer
+from analyzers.git_forensics import GitForensicsAnalyzer
+from analyzers.jwt import JWTAnalyzer
 
 # ---------------------------------------------------------------------------
 # Magic byte signatures mapped to analyzer keys
@@ -56,6 +60,7 @@ _MAGIC_MAP: list[tuple[bytes, list[str]]] = [
     (b"BZh",                   ["archive"]),
     (b"\xfd7zXZ\x00",         ["archive"]),
     (b"Rar!\x1a\x07",         ["archive"]),
+    (b"\x37\x7a\xbc\xaf\x27\x1c", ["archive"]),  # 7z
     (b"%PDF",                  ["document"]),
     (b"\xd0\xcf\x11\xe0",     ["document"]),   # OLE (DOC, XLS, PPT)
     (b"\x7fELF",              ["binary", "disassembly"]),
@@ -111,6 +116,10 @@ _ANALYZER_REGISTRY: dict[str, type[Analyzer]] = {
     "image_format":    ImageFormatAnalyzer,
     "crypto_rsa":      CryptoRSAAnalyzer,
     "sal":             SalAnalyzer,
+    "crypto_prng":     CryptoPRNGAnalyzer,
+    "side_channel":    SideChannelAnalyzer,
+    "git_forensics":   GitForensicsAnalyzer,
+    "jwt":             JWTAnalyzer,
 }
 
 # PEM/DER/RSA detection patterns
@@ -196,7 +205,7 @@ def _run_dispatch(
     all_findings.extend(generic.analyze(path, flag_pattern, depth, ai_client))
 
     # Always-run analyzers
-    always_run = ("encoding", "crypto", "classical_cipher", "forensics_timeline")
+    always_run = ("encoding", "crypto", "classical_cipher", "forensics_timeline", "crypto_prng", "side_channel", "jwt")
     for key in always_run:
         if restrict_analyzers is not None and key not in restrict_analyzers:
             continue
@@ -428,6 +437,23 @@ def _identify_analyzers(path: str, data: bytes) -> list[str]:
                         keys.remove("archive")
             except Exception:
                 pass
+
+    # Git bundle or URL file
+    if Path(path).suffix.lower() == ".bundle":
+        if "git_forensics" not in keys:
+            keys.append("git_forensics")
+    elif re.search(rb"https?://(?:www\.)?(?:github|gitlab)\.com/[\w.\-]+/[\w.\-]",
+                   data, re.IGNORECASE):
+        if "git_forensics" not in keys:
+            keys.append("git_forensics")
+
+    # .7z extension fallback (magic-based detection above covers most cases)
+    if Path(path).suffix.lower() == ".7z" and "archive" not in keys:
+        keys.append("archive")
+
+    # .rar extension fallback
+    if Path(path).suffix.lower() == ".rar" and "archive" not in keys:
+        keys.append("archive")
 
     # PCAP extension fallback
     if Path(path).suffix.lower() in (".pcap", ".pcapng", ".cap") and "pcap" not in keys:

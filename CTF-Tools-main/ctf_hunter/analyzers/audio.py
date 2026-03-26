@@ -37,8 +37,8 @@ class AudioAnalyzer(Analyzer):
         findings.extend(self._check_silence(path))
 
         if depth == "deep":
-            # LSB in WAV PCM
-            findings.extend(self._check_wav_lsb(path, flag_pattern))
+            # LSB in WAV PCM (extended: multi-channel, bit planes, packing variants)
+            findings.extend(self._check_lsb_samples(path, flag_pattern))
 
         # Phase cancellation + spectrogram steg (always run — too valuable to gate on deep)
         findings.extend(self._phase_cancellation_analysis(path, flag_pattern))
@@ -184,6 +184,118 @@ class AudioAnalyzer(Analyzer):
                 confidence=0.75 if fm else 0.55,
             )]
         return []
+
+    def _check_lsb_samples(self, path: str, flag_pattern: re.Pattern) -> List[Finding]:
+        """Extended LSB extraction from WAV samples.
+
+        Variants tried (combinatorially):
+          Channels   : each channel individually + interleaved (all channels)
+          Bit plane  : 0 (LSB), 1
+          Bit packing: MSB-first, LSB-first
+          Sample widths: 8-bit unsigned, 16-bit signed
+
+        Findings emitted:
+          HIGH + flag_match=True  → flag pattern in extracted bytes
+          MEDIUM                  → ≥70% printable ASCII
+
+        Deduplication: first 256 bytes of each variant keyed in a seen-set.
+        Requires numpy; silently skips if unavailable.
+        """
+        try:
+            import wave as _wave
+            with _wave.open(path, "rb") as wf:
+                sampwidth  = wf.getsampwidth()
+                nchannels  = wf.getnchannels()
+                nframes    = min(wf.getnframes(), 500_000)
+                raw        = wf.readframes(nframes)
+        except Exception:
+            return []
+
+        if sampwidth not in (1, 2):
+            return []
+
+        try:
+            import numpy as np
+        except ImportError:
+            return []
+
+        try:
+            if sampwidth == 2:
+                arr = np.frombuffer(raw, dtype=np.int16)
+            else:
+                arr = np.frombuffer(raw, dtype=np.uint8)
+        except Exception:
+            return []
+
+        # Shape: (nframes, nchannels); handle mono without reshape error
+        if nchannels > 1:
+            arr = arr[:len(arr) - len(arr) % nchannels].reshape(-1, nchannels)
+        else:
+            arr = arr.reshape(-1, 1)
+
+        # Channel configs: individual channels + interleaved
+        channel_configs: List[Tuple[str, object]] = [
+            (f"ch{c}", arr[:, c]) for c in range(nchannels)
+        ]
+        channel_configs.append(("interleaved", arr.flatten()))
+
+        findings: List[Finding] = []
+        seen: set = set()
+        msb_weights = np.array([128, 64, 32, 16, 8, 4, 2, 1], dtype=np.uint16)
+        lsb_weights = np.array([  1,  2,  4,  8, 16, 32, 64, 128], dtype=np.uint16)
+
+        for ch_label, ch_arr in channel_configs:
+            for plane in (0, 1):
+                bits = (ch_arr >> plane) & 1
+                for pack_name, weights in (("MSB", msb_weights), ("LSB", lsb_weights)):
+                    n = (len(bits) // 8) * 8
+                    if n < 64:
+                        continue
+                    byte_vals = (
+                        bits[:n].reshape(-1, 8).astype(np.uint16) * weights
+                    ).sum(axis=1).astype(np.uint8)
+
+                    dedup_key = bytes(byte_vals[:256])
+                    if dedup_key in seen:
+                        continue
+                    seen.add(dedup_key)
+
+                    text = byte_vals.tobytes().decode("latin-1")
+                    fm = self._check_flag(text, flag_pattern)
+                    label = f"{ch_label}/bit{plane}/{pack_name}"
+
+                    if fm:
+                        findings.append(self._finding(
+                            path,
+                            f"LSB steg: flag found in audio ({label})",
+                            f"Variant: {label}\n"
+                            f"Decoded: {text[:300]}\n"
+                            f"raw_hex={byte_vals[:64].tobytes().hex()}",
+                            severity="HIGH",
+                            flag_match=True,
+                            confidence=0.95,
+                        ))
+                    else:
+                        sample = byte_vals[:1000]
+                        printable = int(
+                            np.sum((sample >= 0x20) & (sample <= 0x7E))
+                            + np.sum(np.isin(sample, [9, 10, 13]))
+                        )
+                        total = len(sample)
+                        if total > 0 and printable / total >= 0.70:
+                            preview = byte_vals[:200].tobytes().decode("ascii", errors="replace")
+                            findings.append(self._finding(
+                                path,
+                                f"LSB steg: printable payload in audio ({label})",
+                                f"Variant: {label}\n"
+                                f"Printable ratio: {printable/total:.2f}\n"
+                                f"Preview: {preview[:200]}\n"
+                                f"raw_hex={byte_vals[:64].tobytes().hex()}",
+                                severity="MEDIUM",
+                                confidence=0.60,
+                            ))
+
+        return findings
 
     # ------------------------------------------------------------------
     # Phase cancellation + spectrogram steganography
